@@ -58,12 +58,19 @@ pub const QuantMode = enum(u8) {
     exact = 0,
     fp8 = 1,
     nvfp4 = 2,
+    /// fp8 dense attention + BF16 router/controllers, but NVFP4 experts (L0-23) and lm_head. Fits 16 GB cards.
+    mix = 3,
+
+    pub fn expert_mode(self: QuantMode) QuantMode {
+        return if (self == .mix) .nvfp4 else self;
+    }
 
     pub fn name(self: QuantMode) []const u8 {
         return switch (self) {
             .exact => "exact",
             .fp8 => "fp8",
             .nvfp4 => "nvfp4",
+            .mix => "mix",
         };
     }
 };

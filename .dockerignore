@@ -1,0 +1,6 @@
+.git
+assets
+zig-out
+.zig-cache
+models
+*.gguf

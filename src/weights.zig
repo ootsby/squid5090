@@ -138,9 +138,10 @@ pub const ModelWeights = struct {
 
         const dense_kind: constants.WeightKind = switch (quant_mode) {
             .exact => .bf16,
-            .fp8 => .fp8,
+            .fp8, .mix => .fp8,
             .nvfp4 => .nvfp4,
         };
+        const unembed_kind: constants.WeightKind = if (quant_mode == .mix) .nvfp4 else dense_kind;
         const env_mtp_bf16 = tiger.getenv("SQUID_MTP_BF16");
         const force_mtp_bf16: bool = (env_mtp_bf16 != null and env_mtp_bf16.?[0] == '1');
         const mtp_kind: constants.WeightKind = if (quant_mode == .exact or force_mtp_bf16) .bf16 else .nvfp4;
@@ -162,6 +163,7 @@ pub const ModelWeights = struct {
         const total_vram_bytes: u64 = compute_total_vram_bytes(
             quant_mode,
             dense_kind,
+            unembed_kind,
             mtp_kind,
             embed_on_host,
             has_mtp,
@@ -216,7 +218,7 @@ pub const ModelWeights = struct {
             const usable_bytes: usize = @as(usize, constants.vocab_unpadded_count) * constants.hidden_dim * 2;
             tiger.assert(ui.byte_length >= usable_bytes);
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(d_stage, sf_main.data_ptr(ui), usable_bytes));
-            self.unembed = self.pack_linear(d_stage, constants.vocab_unpadded_count, constants.hidden_dim, dense_kind, d_amax);
+            self.unembed = self.pack_linear(d_stage, constants.vocab_unpadded_count, constants.hidden_dim, unembed_kind, d_amax);
         }
 
         // AttnRes & cross-pass queries
@@ -357,8 +359,8 @@ pub const ModelWeights = struct {
             lw.router_bias = self.upload_f32(&sf_main, rb_name, constants.expert_count);
 
             // MoE Expert Banks (w13 and w2)
-            lw.w13 = self.load_expert_bank(&sf_main, layer_idx, "w13", 2 * constants.intermediate_dim, constants.hidden_dim, quant_mode, d_stage);
-            lw.w2 = self.load_expert_bank(&sf_main, layer_idx, "w2", constants.hidden_dim, constants.intermediate_dim, quant_mode, d_stage);
+            lw.w13 = self.load_expert_bank(&sf_main, layer_idx, "w13", 2 * constants.intermediate_dim, constants.hidden_dim, quant_mode.expert_mode(), d_stage);
+            lw.w2 = self.load_expert_bank(&sf_main, layer_idx, "w2", constants.hidden_dim, constants.intermediate_dim, quant_mode.expert_mode(), d_stage);
         }
 
         // Load DSpark MTP weights if available
@@ -898,6 +900,7 @@ fn try_load_draft_vocab(model_directory: []const u8, quant_mode: constants.Quant
 fn compute_total_vram_bytes(
     quant_mode: constants.QuantMode,
     dense_kind: constants.WeightKind,
+    unembed_kind: constants.WeightKind,
     mtp_kind: constants.WeightKind,
     embed_on_host: bool,
     has_mtp: bool,
@@ -914,7 +917,7 @@ fn compute_total_vram_bytes(
     }
     total += tiger.align_up_u64(constants.hidden_dim * 2, a); // embed_norm
     total += tiger.align_up_u64(constants.hidden_dim * 2, a); // final_norm
-    total += constants.linear_weight_vram_bytes(constants.vocab_unpadded_count, constants.hidden_dim, dense_kind); // unembed
+    total += constants.linear_weight_vram_bytes(constants.vocab_unpadded_count, constants.hidden_dim, unembed_kind); // unembed
 
     var l: u32 = 1;
     while (l < constants.layer_count) : (l += 1) {
@@ -980,7 +983,7 @@ fn compute_total_vram_bytes(
             .{ 2 * constants.intermediate_dim, constants.hidden_dim },
             .{ constants.hidden_dim, constants.intermediate_dim },
         };
-        const is_nvfp4_bank: bool = constants.is_nvfp4_expert_layer(l) or quant_mode == .nvfp4;
+        const is_nvfp4_bank: bool = constants.is_nvfp4_expert_layer(l) or quant_mode.expert_mode() == .nvfp4;
         for (dims) |d| {
             const rows: u64 = d[0];
             const cols: u64 = d[1];

@@ -601,7 +601,8 @@ fn parse_mode(s: []const u8) constants.QuantMode {
     if (std.mem.eql(u8, s, "exact")) return .exact;
     if (std.mem.eql(u8, s, "fp8")) return .fp8;
     if (std.mem.eql(u8, s, "nvfp4")) return .nvfp4;
-    tiger.print_stderr("Unknown mode '{s}' (expected exact|fp8|nvfp4)\n", .{s});
+    if (std.mem.eql(u8, s, "mix")) return .mix;
+    tiger.print_stderr("Unknown mode '{s}' (expected exact|fp8|nvfp4|mix)\n", .{s});
     @panic("Invalid quantization mode");
 }
 
