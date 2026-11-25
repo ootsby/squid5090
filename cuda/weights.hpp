@@ -24,6 +24,7 @@ struct LinearWeight {
 
 struct ExpertBank {
     bool is_nvfp4 = true; // true: NVFP4, false: MXFP8
+    bool is_iq3 = false;  // w13 only: IQ3_XXS, data/scales laid out by tools/mkiq3.py
     int n_experts = NUM_EXPERTS;
     int rows = 0; // w13: 2*INTERMEDIATE=2304, w2: HIDDEN=2304
     int cols = 0; // w13: HIDDEN=2304, w2: INTERMEDIATE=1152

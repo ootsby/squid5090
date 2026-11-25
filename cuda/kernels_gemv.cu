@@ -1986,6 +1986,37 @@ constexpr int MOE_DOWN_WARPS = MOE_DOWN_GROUPS * MOE_DOWN_PAR; // 18 warps (576 
 template <int FMT> struct MoeFrag;
 template <> struct MoeFrag<0> { Nvfp4Chunk32 r0, r1; uint32_t x[16]; };
 template <> struct MoeFrag<1> { Mxfp8Chunk32 r0, r1; uint32_t x[16]; };
+struct Iq3Chunk32 { uint2 q; uint32_t ss; uint16_t d; };
+template <> struct MoeFrag<2> { Iq3Chunk32 r0, r1; uint32_t x[16]; };
+
+__device__ __forceinline__ Iq3Chunk32 load_iq3_chunk32(const uint8_t* row, const uint8_t* d, int c) {
+    const uint8_t* p = row + (c >> 2) * 48;
+    Iq3Chunk32 ch;
+    ch.q = ld_stream_u2(p + (c & 3) * 8);
+    ch.ss = ld_stream_u32(p + 32 + (c & 3) * 4);
+    ch.d = ld_scale_u16(d + (c >> 3) * 2);
+    return ch;
+}
+
+__device__ __forceinline__ void decode_iq3_chunk32_f16(const Iq3Chunk32& ch, const uint2* grid, uint32_t (&o)[16]) {
+    const __half2 sc = iq3_scale(ch.d, ch.ss);
+    #pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const uint32_t s8 = iq3_signs(ch.ss, l);
+        const uint32_t word = (l < 2) ? ch.q.x : ch.q.y;
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const uint2 g = grid[(word >> (8 * (2 * (l & 1) + j))) & 0xFFu];
+            const uint32_t n = s8 >> (4 * j);
+            const uint32_t w0 = g.x ^ ((n & 1u) << 15) ^ ((n & 2u) << 30);
+            const uint32_t w1 = g.y ^ ((n & 4u) << 13) ^ ((n & 8u) << 28);
+            __half2 p0 = __hmul2(*reinterpret_cast<const __half2*>(&w0), sc);
+            __half2 p1 = __hmul2(*reinterpret_cast<const __half2*>(&w1), sc);
+            o[4 * l + 2 * j + 0] = *reinterpret_cast<uint32_t*>(&p0);
+            o[4 * l + 2 * j + 1] = *reinterpret_cast<uint32_t*>(&p1);
+        }
+    }
+}
 
 template <int FMT, int K>
 __device__ __forceinline__ void moe_load_w(
@@ -1994,6 +2025,10 @@ __device__ __forceinline__ void moe_load_w(
         constexpr int CB = K >> 1, SB = K >> 4;
         f.r0 = load_nvfp4_chunk32(codes, scales, c);
         f.r1 = load_nvfp4_chunk32(codes + 8 * CB, scales + 8 * SB, c);
+    } else if constexpr (FMT == 2) {
+        static_assert(K == HIDDEN);
+        f.r0 = load_iq3_chunk32(codes, scales, c);
+        f.r1 = load_iq3_chunk32(codes + 8 * IQ3_ROW_BYTES, scales + 8 * IQ3_D_ROW_BYTES, c);
     } else {
         constexpr int CB = K, SB = K >> 5;
         f.r0 = load_mxfp8_chunk32(codes, scales, c);
@@ -2008,7 +2043,7 @@ __device__ __forceinline__ void moe_load_x(MoeFrag<FMT>& f, const __half* xrow, 
         #pragma unroll
         for (int v = 0; v < 4; ++v) {
             uint4 q = ld_dep_u4(xp + v * 8);
-            if constexpr (FMT == 0) {
+            if constexpr (FMT != 1) {
                 f.x[4 * v + 0] = q.x; f.x[4 * v + 1] = q.y;
                 f.x[4 * v + 2] = q.z; f.x[4 * v + 3] = q.w;
             } else {
@@ -2027,11 +2062,16 @@ __device__ __forceinline__ void moe_load_x(MoeFrag<FMT>& f, const __half* xrow, 
 }
 
 template <int FMT>
-__device__ __forceinline__ void moe_mma_frag(const MoeFrag<FMT>& f, float (&d)[4]) {
+__device__ __forceinline__ void moe_mma_frag(const MoeFrag<FMT>& f, float (&d)[4], const uint2* grid = nullptr) {
     uint32_t a[16], b[16];
-    if constexpr (FMT == 0) {
-        decode_nvfp4_chunk32_f16(f.r0, a);
-        decode_nvfp4_chunk32_f16(f.r1, b);
+    if constexpr (FMT != 1) {
+        if constexpr (FMT == 0) {
+            decode_nvfp4_chunk32_f16(f.r0, a);
+            decode_nvfp4_chunk32_f16(f.r1, b);
+        } else {
+            decode_iq3_chunk32_f16(f.r0, grid, a);
+            decode_iq3_chunk32_f16(f.r1, grid, b);
+        }
         #pragma unroll
         for (int i = 0; i < 8; ++i) {
             mma_m16n8k16_f32_f16(d[0], d[1], d[2], d[3],
@@ -2070,8 +2110,9 @@ moe_up_tc_kernel(
     __half* __restrict__ out_act_h) {
     constexpr int K = HIDDEN;
     constexpr int R = 2 * INTERMEDIATE;
-    constexpr int CB = (FMT == 0) ? (K >> 1) : K;
-    constexpr int SB = (FMT == 0) ? (K >> 4) : (K >> 5);
+    constexpr int CB = (FMT == 0) ? (K >> 1) : (FMT == 2) ? IQ3_ROW_BYTES : K;
+    constexpr int SB = (FMT == 0) ? (K >> 4) : (FMT == 2) ? IQ3_D_ROW_BYTES : (K >> 5);
+    __shared__ uint2 grid[(FMT == 2) ? 256 : 1];
     __shared__ float red[MOE_UP_WARPS][32][4];
     __shared__ float tile_out[MOE_TILE][MOE_MAXM + 1];
 
@@ -2098,7 +2139,11 @@ moe_up_tc_kernel(
     moe_load_w<FMT, K>(f, w + row * CB, ws + row * SB, 4 * warp + t);
     moe_load_x<FMT>(f, on ? (x_h + (size_t)g * K) : nullptr, 4 * warp + t);
     float d[4] = {0.f, 0.f, 0.f, 0.f};
-    moe_mma_frag<FMT>(f, d);
+    if constexpr (FMT == 2) {
+        if (threadIdx.x < 256) grid[threadIdx.x] = iq3_grid_entry(threadIdx.x);
+        __syncthreads();
+    }
+    moe_mma_frag<FMT>(f, d, grid);
 
     #pragma unroll
     for (int v = 0; v < 4; ++v) red[warp][lane][v] = d[v];
@@ -2111,7 +2156,7 @@ moe_up_tc_kernel(
             #pragma unroll
             for (int v = 0; v < 4; ++v) s[v] += red[ww][lane][v];
         }
-        float es = (FMT == 0) ? wfactor[e] : 1.0f;
+        float es = (FMT != 1) ? wfactor[e] : 1.0f;
         tile_out[g][2 * t]         = s[0] * es;
         tile_out[g][2 * t + 1]     = s[1] * es;
         tile_out[g + 8][2 * t]     = s[2] * es;
@@ -2434,7 +2479,10 @@ void launch_moe_gate_up_h(
     const ExpertBank& w13, const __half* x_h, const int32_t* route_ids,
     const ExpertGroups* /*groups*/, __half* out_act_h, int B, cudaStream_t stream) {
     dim3 grid((2 * INTERMEDIATE) / MOE_TILE, B * TOP_K);
-    if (w13.is_nvfp4) {
+    if (w13.is_iq3) {
+        launch_pdl(moe_up_tc_kernel<2>, grid, MOE_UP_WARPS * 32, stream,
+            x_h, route_ids, w13.data, w13.scales, w13.expert_scale, B, out_act_h);
+    } else if (w13.is_nvfp4) {
         launch_pdl(moe_up_tc_kernel<0>, grid, MOE_UP_WARPS * 32, stream,
             x_h, route_ids, w13.data, w13.scales, w13.expert_scale, B, out_act_h);
     } else {

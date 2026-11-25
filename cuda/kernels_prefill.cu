@@ -549,21 +549,23 @@ __device__ __forceinline__ int wg_swz(int row, int chunk) {
 
 template <int FMT, int K, int TM>
 struct WgCfg {
-    static constexpr int CODE_ROW  = (FMT == 0) ? (K / 2) : K;
-    static constexpr int SCALE_ROW = (FMT == 0) ? (K / 16) : (K / 32);
-    static constexpr int WK        = (FMT == 0) ? 128 : 64;
+    static_assert(FMT != 2 || K == HIDDEN);
+    static constexpr int CODE_ROW  = (FMT == 0) ? (K / 2) : (FMT == 2) ? IQ3_ROW_BYTES : K;
+    static constexpr int SCALE_ROW = (FMT == 0) ? (K / 16) : (FMT == 2) ? IQ3_D_ROW_BYTES : (K / 32);
+    static constexpr int WK        = (FMT != 1) ? 128 : 64;
     static constexpr int R         = WK / WG_BK;
     static constexpr int KC        = K / WK;
-    static constexpr int WS        = (TM <= 32) ? ((FMT == 0) ? 6 : 7) : ((FMT == 0) ? 3 : 4);
+    static constexpr int WS        = (TM <= 32) ? ((FMT != 1) ? 6 : 7) : ((FMT != 1) ? 3 : 4);
     static_assert(R * (WS - 1) >= WG_AS);
-    static constexpr int WCODE     = (FMT == 0) ? (WK / 2) : WK;
-    static constexpr int WSTRIDE   = WCODE + 16;
+    static constexpr int WCODE     = (FMT == 0) ? (WK / 2) : (FMT == 2) ? 48 : WK;
+    static constexpr int WSTRIDE   = (FMT == 2) ? WCODE : WCODE + 16; // 48 and 80 both spread 8 rows across the smem banks
     static constexpr int W_BYTES   = WG_TN * WSTRIDE;
     static constexpr int A_BYTES   = TM * WG_BK * 2;
     static constexpr int SC_BYTES  = WG_TN * SCALE_ROW;
     static constexpr int OFF_W     = WG_AS * A_BYTES;
     static constexpr int OFF_SC    = OFF_W + WS * W_BYTES;
-    static constexpr int SMEM      = (OFF_SC + SC_BYTES + 15) / 16 * 16;
+    static constexpr int OFF_GRID  = (OFF_SC + SC_BYTES + 15) / 16 * 16;
+    static constexpr int SMEM      = OFF_GRID + ((FMT == 2) ? 2048 : 0);
     static_assert(K % WK == 0 && SMEM <= 101376);
 };
 
@@ -610,6 +612,7 @@ p_wgemm_kernel(
     unsigned char* a_smem = smem;
     unsigned char* w_smem = smem + C::OFF_W;
     uint8_t* sc_smem = smem + C::OFF_SC;
+    uint2* iq3_grid = reinterpret_cast<uint2*>(smem + C::OFF_GRID);
 
     const int tid = threadIdx.x;
     const int lane = tid & 31;
@@ -651,9 +654,7 @@ p_wgemm_kernel(
     auto load_w = [&](int chunk) {
         unsigned char* ws = w_smem + (chunk % C::WS) * C::W_BYTES;
         constexpr int CPR = C::WCODE / 16;
-        #pragma unroll
-        for (int i = 0; i < WG_TN * CPR / WG_NT; ++i) {
-            const int id = tid + i * WG_NT;
+        for (int id = tid; id < WG_TN * CPR; id += WG_NT) { // CPR = 3 (IQ3) does not divide evenly into WG_NT
             const int row = id / CPR;
             const int ch = id % CPR;
             wg_cp_async16(ws + row * C::WSTRIDE + ch * 16,
@@ -665,6 +666,8 @@ p_wgemm_kernel(
         wg_cp_commit();
     };
 
+    static_assert(WG_NT == 256);
+    if constexpr (FMT == 2) iq3_grid[tid] = iq3_grid_entry(tid);
     for (int id = tid; id < C::SC_BYTES / 4; id += WG_NT) {
         int byte_off = id * 4;
         wg_cp_async4(sc_smem + byte_off, scale_tile + (size_t)(byte_off / C::SCALE_ROW) * C::SCALE_ROW + (byte_off % C::SCALE_ROW));
@@ -677,7 +680,7 @@ p_wgemm_kernel(
     for (int j = 0; j < WG_AS - 1; ++j) issue(j);
 
     const int c = lane & 3;
-    const float factor = (FMT == 0) ? __ldg(w_factors + e) : 1.0f;
+    const float factor = (FMT != 1) ? __ldg(w_factors + e) : 1.0f;
     const int mact = min((n + 15) / 16, TM / 16);
     float acc[TM / 16][2][4];
     #pragma unroll
@@ -698,6 +701,12 @@ p_wgemm_kernel(
                 sc[nt][1] = __high2half2(lo);
                 sc[nt][2] = __low2half2(hi);
                 sc[nt][3] = __high2half2(hi);
+            } else if constexpr (FMT == 2) {
+                const uint32_t* sw = reinterpret_cast<const uint32_t*>(
+                    w_smem + ((ks / C::R) % C::WS) * C::W_BYTES + row * C::WSTRIDE + 32) + (ks % C::R) * 2;
+                const uint16_t d = *reinterpret_cast<const uint16_t*>(sc_smem + row * C::SCALE_ROW + (ks >> 2) * 2);
+                sc[nt][0] = sc[nt][1] = iq3_scale(d, sw[0]);
+                sc[nt][2] = sc[nt][3] = iq3_scale(d, sw[1]);
             } else {
                 // Store raw UE8M0 bytes in sc_u8 via sc; decode in FP32 to avoid FP16 underflow/Inf*0=NaN!
                 const uint8_t* ms = sc_smem + row * C::SCALE_ROW + ks * 2;
@@ -726,6 +735,20 @@ p_wgemm_kernel(
                 __half2 h1 = __hmul2(cvt_e2m1x2_to_half2(b1), s);
                 b[kk][nt][0] = *reinterpret_cast<const uint32_t*>(&h0);
                 b[kk][nt][1] = *reinterpret_cast<const uint32_t*>(&h1);
+            } else if constexpr (FMT == 2) {
+                // This lane takes weights 2c..2c+1 and 8+2c..9+2c of the 16: one codebook half2 from each group of 8.
+                const unsigned char* rp = ws + row * C::WSTRIDE;
+                const uint32_t q = *reinterpret_cast<const uint32_t*>(rp + (kc >> 2));
+                const uint32_t ss = *reinterpret_cast<const uint32_t*>(rp + 32 + (kc >> 5) * 4);
+                #pragma unroll
+                for (int g = 0; g < 2; ++g) {
+                    const uint32_t idx = (q >> (8 * (2 * g + (c >> 1)))) & 0xFFu;
+                    const uint32_t n = iq3_signs(ss, ((kc >> 3) & 3) + g) >> (2 * c);
+                    const uint32_t v = reinterpret_cast<const uint32_t*>(iq3_grid + idx)[c & 1]
+                                       ^ ((n & 1u) << 15) ^ ((n & 2u) << 30);
+                    __half2 h = __hmul2(*reinterpret_cast<const __half2*>(&v), s);
+                    b[kk][nt][g] = *reinterpret_cast<const uint32_t*>(&h);
+                }
             } else {
                 const uint4 q = *reinterpret_cast<const uint4*>(ws + row * C::WSTRIDE + kc);
                 const uint32_t w0 = (c >> 1) ? q.y : q.x;
@@ -826,7 +849,7 @@ static void dispatch_wgemm_tm(
     // Max 256 active tiles by pigeonhole bound (B<=512 w/ TR=32 or B<=2048 w/ TR=128)
     int grid = 256 * NTILES_N;
     p_wgemm_kernel<FMT, MODE, K, TM><<<grid, WG_NT, SMEM, stream>>>(
-        eb.data, eb.scales, (FMT == 0) ? eb.expert_scale : nullptr,
+        eb.data, eb.scales, (FMT != 1) ? eb.expert_scale : nullptr,
         x_h, expert_offsets, sorted_tok, sorted_slot, sorted_w, out_act_h, out_slots);
 }
 
@@ -1461,7 +1484,10 @@ void launch_prefill_moe_gate_up_h(
     const ExpertBank& w13, const __half* x_h,
     const int32_t* expert_offsets, const int32_t* sorted_tok, const int32_t* sorted_slot,
     __half* out_act_h, int B, cudaStream_t stream) {
-    if (w13.is_nvfp4) {
+    if (w13.is_iq3) {
+        if (B <= 512) dispatch_wgemm_tm<2, WgemmMode::Up, HIDDEN, 32>(w13, x_h, expert_offsets, sorted_tok, sorted_slot, nullptr, out_act_h, nullptr, stream);
+        else          dispatch_wgemm_tm<2, WgemmMode::Up, HIDDEN, 128>(w13, x_h, expert_offsets, sorted_tok, sorted_slot, nullptr, out_act_h, nullptr, stream);
+    } else if (w13.is_nvfp4) {
         if (B <= 512) dispatch_wgemm_tm<0, WgemmMode::Up, HIDDEN, 32>(w13, x_h, expert_offsets, sorted_tok, sorted_slot, nullptr, out_act_h, nullptr, stream);
         else          dispatch_wgemm_tm<0, WgemmMode::Up, HIDDEN, 128>(w13, x_h, expert_offsets, sorted_tok, sorted_slot, nullptr, out_act_h, nullptr, stream);
     } else {

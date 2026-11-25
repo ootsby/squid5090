@@ -29,6 +29,9 @@ pub const sconv_ring_slots: u32 = 16;
 pub const expert_count: u32 = 128;
 pub const top_k_experts: u32 = 8;
 pub const intermediate_dim: u32 = 1152;
+// IQ3_XXS w13 bank (tools/mkiq3.py): 864 code + 18 scale bytes per row
+pub const iq3_codes_bytes: u64 = @as(u64, expert_count) * 2 * intermediate_dim * 864;
+pub const iq3_d_bytes: u64 = @as(u64, expert_count) * 2 * intermediate_dim * 18;
 pub const vocab_padded_count: u32 = 201024;
 pub const vocab_unpadded_count: u32 = 200058;
 pub const eos_token_id: i32 = 200006;

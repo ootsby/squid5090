@@ -268,6 +268,7 @@ struct CLinearWeight {
 
 struct CExpertBank {
     uint8_t is_nvfp4;
+    uint8_t is_iq3;
     int32_t n_experts;
     int32_t rows;
     int32_t cols;
@@ -337,6 +338,7 @@ static LinearWeight to_lw(const CLinearWeight& c) {
 static ExpertBank to_eb(const CExpertBank& c) {
     ExpertBank eb;
     eb.is_nvfp4 = (c.is_nvfp4 != 0);
+    eb.is_iq3 = (c.is_iq3 != 0);
     eb.n_experts = c.n_experts;
     eb.rows = c.rows;
     eb.cols = c.cols;

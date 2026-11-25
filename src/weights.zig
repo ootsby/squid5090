@@ -136,6 +136,17 @@ pub const ModelWeights = struct {
         }
         defer if (has_ablation) sf_abl.close_file();
 
+        // Optional IQ3_XXS w13 banks (tools/mkiq3.py): mix mode uses them for whichever layers the file holds.
+        var iq3_path_buf: [1024]u8 = undefined;
+        const iq3_path_z = tiger.format_path_z(&iq3_path_buf, model_directory, "/iq3.safetensors");
+        var sf_iq3: safetensors.SafetensorsFile = .{};
+        const env_iq3 = tiger.getenv("SQUID_IQ3");
+        const want_iq3: bool = quant_mode == .mix and !(env_iq3 != null and env_iq3.?[0] == '0');
+        const has_iq3: bool = want_iq3 and sf_iq3.open_file(iq3_path_z);
+        defer if (has_iq3) sf_iq3.close_file();
+        const iq3: ?*const safetensors.SafetensorsFile = if (has_iq3) &sf_iq3 else null;
+        if (has_iq3) tiger.print_stdout("[weights] IQ3_XXS w13 banks: {d} layers from iq3.safetensors\n", .{sf_iq3.tensor_count / 3});
+
         const dense_kind: constants.WeightKind = switch (quant_mode) {
             .exact => .bf16,
             .fp8, .mix => .fp8,
@@ -171,6 +182,7 @@ pub const ModelWeights = struct {
             draft_vocab_count,
             has_ablation,
             has_ablation_detectors,
+            iq3,
         );
         self.arena = vram_arena.VRAMArena.init(total_vram_bytes);
 
@@ -359,7 +371,7 @@ pub const ModelWeights = struct {
             lw.router_bias = self.upload_f32(&sf_main, rb_name, constants.expert_count);
 
             // MoE Expert Banks (w13 and w2)
-            lw.w13 = self.load_expert_bank(&sf_main, layer_idx, "w13", 2 * constants.intermediate_dim, constants.hidden_dim, quant_mode.expert_mode(), d_stage);
+            lw.w13 = if (iq3_bank_present(iq3, layer_idx)) self.load_iq3_bank(iq3.?, layer_idx) else self.load_expert_bank(&sf_main, layer_idx, "w13", 2 * constants.intermediate_dim, constants.hidden_dim, quant_mode.expert_mode(), d_stage);
             lw.w2 = self.load_expert_bank(&sf_main, layer_idx, "w2", constants.hidden_dim, constants.intermediate_dim, quant_mode.expert_mode(), d_stage);
         }
 
@@ -461,6 +473,22 @@ pub const ModelWeights = struct {
             },
         }
         return lw;
+    }
+
+    fn load_iq3_bank(self: *ModelWeights, sf: *const safetensors.SafetensorsFile, layer_idx: u32) cuda.CExpertBank {
+        var eb: cuda.CExpertBank = .{
+            .is_iq3 = 1,
+            .n_experts = constants.expert_count,
+            .rows = 2 * constants.intermediate_dim,
+            .cols = constants.hidden_dim,
+        };
+        var nbuf: [128]u8 = undefined;
+        eb.data = self.arena.alloc_many(u8, constants.iq3_codes_bytes);
+        eb.scales = self.arena.alloc_many(u8, constants.iq3_d_bytes);
+        upload_raw(sf, iq3_name(&nbuf, layer_idx, "codes"), @ptrCast(eb.data.?), constants.iq3_codes_bytes);
+        upload_raw(sf, iq3_name(&nbuf, layer_idx, "d"), @ptrCast(eb.scales.?), constants.iq3_d_bytes);
+        eb.expert_scale = self.upload_f32(sf, iq3_name(&nbuf, layer_idx, "scale"), constants.expert_count);
+        return eb;
     }
 
     fn load_expert_bank(
@@ -832,6 +860,16 @@ fn normalize_rows_f32(buf: []f32, rows: usize, cols: usize) void {
     }
 }
 
+fn iq3_name(buf: *[128]u8, layer_idx: u32, part: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "model.llm.layers.{d}.mlp.experts.w13_iq3_{s}", .{ layer_idx, part }) catch unreachable;
+}
+
+fn iq3_bank_present(iq3: ?*const safetensors.SafetensorsFile, layer_idx: u32) bool {
+    var nbuf: [128]u8 = undefined;
+    const sf = iq3 orelse return false;
+    return sf.lookup_optional(iq3_name(&nbuf, layer_idx, "codes")) != null;
+}
+
 fn upload_raw(sf: *const safetensors.SafetensorsFile, name: []const u8, dst_dev: *anyopaque, expected_bytes: u64) void {
     const info = sf.lookup(name);
     tiger.assert(info.byte_length == expected_bytes);
@@ -908,6 +946,7 @@ fn compute_total_vram_bytes(
     draft_vocab_count: u32,
     has_ablation: bool,
     has_ablation_detectors: bool,
+    iq3: ?*const safetensors.SafetensorsFile,
 ) u64 {
     const a = constants.vram_alignment_bytes;
     var total: u64 = 0;
@@ -984,9 +1023,15 @@ fn compute_total_vram_bytes(
             .{ constants.hidden_dim, constants.intermediate_dim },
         };
         const is_nvfp4_bank: bool = constants.is_nvfp4_expert_layer(l) or quant_mode.expert_mode() == .nvfp4;
-        for (dims) |d| {
+        for (dims, 0..) |d, bank| {
             const rows: u64 = d[0];
             const cols: u64 = d[1];
+            if (bank == 0 and iq3_bank_present(iq3, l)) {
+                total += tiger.align_up_u64(constants.iq3_codes_bytes, a);
+                total += tiger.align_up_u64(constants.iq3_d_bytes, a);
+                total += tiger.align_up_u64(constants.expert_count * 4, a);
+                continue;
+            }
             if (is_nvfp4_bank) {
                 total += tiger.align_up_u64(@as(u64, constants.expert_count) * rows * (cols / 2), a);
                 total += tiger.align_up_u64(@as(u64, constants.expert_count) * rows * (cols / 16), a);

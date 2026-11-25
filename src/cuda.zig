@@ -23,6 +23,7 @@ pub const CLinearWeight = extern struct {
 
 pub const CExpertBank = extern struct {
     is_nvfp4: u8 = 0,
+    is_iq3: u8 = 0,
     n_experts: i32 = 0,
     rows: i32 = 0,
     cols: i32 = 0,
