@@ -15,7 +15,7 @@ class H(BaseHTTPRequestHandler):
         s.wfile.write(json.dumps({"tag":sys.argv[2],"got":d}).encode())
 time.sleep(1); ThreadingHTTPServer(("127.0.0.1",int(sys.argv[1])),H).serve_forever()'''
 cmd = lambda tag: {'cmd': [sys.executable, '-c', STUB, '8791', tag], 'ctx': 4096}
-CFG = {'default': 'a', 'image': 'x', 'model_dir': '.', 'ablation_file': 'f', 'backend_port': 8791, 'idle_unload_seconds': 0, 'load_timeout': 20,
+CFG = {'default': 'a', 'image': 'x{batch}', 'model_dir': '.', 'ablation_file': 'f', 'backend_port': 8791, 'idle_unload_seconds': 0, 'load_timeout': 20,
        'models': {'a': cmd('a'), 'b': cmd('b'), 'bad': {'cmd': [sys.executable, '-c', 'raise SystemExit(3)']}, 'sq': {'mode': 'nvfp4', 'ctx': 8192}}}
 R = router.Router(CFG)
 S = router.Server(('127.0.0.1', 8790), router.make_handler(R)); threading.Thread(target=S.serve_forever, daemon=True).start()
@@ -39,8 +39,11 @@ try:
         raise AssertionError('accepted')
     s = R.resolve('sq:abl,ctx=16384,mtp=0'); assert (s['abl'], s['ctx'], s['mtp'], s['mode']) == (True, 16384, 0, 'nvfp4')
     assert '--ablation' in R.command(s) and '--ablation' not in R.command(R.resolve('sq'))
+    c = R.command(R.resolve('sq:mode=f8,batch=1024')); assert 'SQUID_IQ3=8' in c and 'x1024' in c and c[c.index('--mode') + 1] == 'mix'
+    c = R.command(s); assert not any('SQUID_IQ3' in x for x in c) and 'x512' in c and c[c.index('--mode') + 1] == 'nvfp4'
+    assert R.resolve('sq:mode=f18,ctx=131072,batch=1024')
     assert R.resolve('sq:abl=0') == R.resolve('sq')
-    for m in ('sq:ctx=1000', 'sq:ctx=x', 'sq:ctx=-1024', 'sq:mode=exact', 'sq:kv=q2', 'sq:mtp=9', 'sq:foo=1', 'sq:image=evil', 'a:abl'): fails(e(m), 400)
+    for m in ('sq:ctx=1000', 'sq:ctx=x', 'sq:ctx=-1024', 'sq:mode=exact', 'sq:kv=q2', 'sq:mtp=9', 'sq:batch=2048', 'sq:mode=f9', 'sq:foo=1', 'sq:image=evil', 'a:abl'): fails(e(m), 400)
     assert 'GiB' in fails(e('sq:ctx=131072'), 400); fails(e('nope'), 404)
     # load, swap, reuse
     assert set(state().values()) == {'unloaded'}

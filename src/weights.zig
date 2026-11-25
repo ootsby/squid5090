@@ -136,23 +136,42 @@ pub const ModelWeights = struct {
         }
         defer if (has_ablation) sf_abl.close_file();
 
-        // Optional IQ3_XXS w13 banks (tools/mkiq3.py): mix mode uses them for whichever layers the file holds.
+        // Optional IQ3_XXS w13 banks (tools/mkiq3.py), mix mode only. SQUID_IQ3 unset: every layer in iq3.safetensors
+        // (mix D) if present. 0: none (mix B). N: layers 0..N-1 from iq3f.safetensors plus an FP8 lm_head (mix F<N>).
+        var f_layers: u32 = 0;
+        var want_iq3: bool = quant_mode == .mix;
+        if (want_iq3) {
+            if (tiger.getenv("SQUID_IQ3")) |v| {
+                f_layers = std.fmt.parseInt(u32, std.mem.span(v), 10) catch constants.layer_count + 1;
+                if (f_layers > constants.layer_count) {
+                    tiger.print_stderr("[weights] SQUID_IQ3 must be 0..{d}\n", .{constants.layer_count});
+                    return false;
+                }
+                want_iq3 = f_layers > 0;
+            }
+        }
+        const iq3_file: []const u8 = if (f_layers > 0) "/iq3f.safetensors" else "/iq3.safetensors";
         var iq3_path_buf: [1024]u8 = undefined;
-        const iq3_path_z = tiger.format_path_z(&iq3_path_buf, model_directory, "/iq3.safetensors");
+        const iq3_path_z = tiger.format_path_z(&iq3_path_buf, model_directory, iq3_file);
         var sf_iq3: safetensors.SafetensorsFile = .{};
-        const env_iq3 = tiger.getenv("SQUID_IQ3");
-        const want_iq3: bool = quant_mode == .mix and !(env_iq3 != null and env_iq3.?[0] == '0');
         const has_iq3: bool = want_iq3 and sf_iq3.open_file(iq3_path_z);
         defer if (has_iq3) sf_iq3.close_file();
         const iq3: ?*const safetensors.SafetensorsFile = if (has_iq3) &sf_iq3 else null;
-        if (has_iq3) tiger.print_stdout("[weights] IQ3_XXS w13 banks: {d} layers from iq3.safetensors\n", .{sf_iq3.tensor_count / 3});
+        const iq3_limit: u32 = if (f_layers > 0) f_layers else constants.layer_count;
+        var iq3_count: u32 = 0;
+        for (0..constants.layer_count) |l| iq3_count += @intFromBool(iq3_bank_present(iq3, @intCast(l), iq3_limit));
+        if (f_layers > 0 and iq3_count != f_layers) {
+            tiger.print_stderr("[weights] SQUID_IQ3={d} needs layers 0..{d} in {s}{s}\n", .{ f_layers, f_layers - 1, model_directory, iq3_file });
+            return false;
+        }
+        if (has_iq3) tiger.print_stdout("[weights] IQ3_XXS w13 banks: {d} layers from {s}\n", .{ iq3_count, iq3_file[1..] });
 
         const dense_kind: constants.WeightKind = switch (quant_mode) {
             .exact => .bf16,
             .fp8, .mix => .fp8,
             .nvfp4 => .nvfp4,
         };
-        const unembed_kind: constants.WeightKind = if (quant_mode == .mix) .nvfp4 else dense_kind;
+        const unembed_kind: constants.WeightKind = if (quant_mode == .mix and f_layers == 0) .nvfp4 else dense_kind;
         const env_mtp_bf16 = tiger.getenv("SQUID_MTP_BF16");
         const force_mtp_bf16: bool = (env_mtp_bf16 != null and env_mtp_bf16.?[0] == '1');
         const mtp_kind: constants.WeightKind = if (quant_mode == .exact or force_mtp_bf16) .bf16 else .nvfp4;
@@ -183,6 +202,7 @@ pub const ModelWeights = struct {
             has_ablation,
             has_ablation_detectors,
             iq3,
+            iq3_limit,
         );
         self.arena = vram_arena.VRAMArena.init(total_vram_bytes);
 
@@ -371,7 +391,7 @@ pub const ModelWeights = struct {
             lw.router_bias = self.upload_f32(&sf_main, rb_name, constants.expert_count);
 
             // MoE Expert Banks (w13 and w2)
-            lw.w13 = if (iq3_bank_present(iq3, layer_idx)) self.load_iq3_bank(iq3.?, layer_idx) else self.load_expert_bank(&sf_main, layer_idx, "w13", 2 * constants.intermediate_dim, constants.hidden_dim, quant_mode.expert_mode(), d_stage);
+            lw.w13 = if (iq3_bank_present(iq3, layer_idx, iq3_limit)) self.load_iq3_bank(iq3.?, layer_idx) else self.load_expert_bank(&sf_main, layer_idx, "w13", 2 * constants.intermediate_dim, constants.hidden_dim, quant_mode.expert_mode(), d_stage);
             lw.w2 = self.load_expert_bank(&sf_main, layer_idx, "w2", constants.hidden_dim, constants.intermediate_dim, quant_mode.expert_mode(), d_stage);
         }
 
@@ -864,7 +884,8 @@ fn iq3_name(buf: *[128]u8, layer_idx: u32, part: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, "model.llm.layers.{d}.mlp.experts.w13_iq3_{s}", .{ layer_idx, part }) catch unreachable;
 }
 
-fn iq3_bank_present(iq3: ?*const safetensors.SafetensorsFile, layer_idx: u32) bool {
+fn iq3_bank_present(iq3: ?*const safetensors.SafetensorsFile, layer_idx: u32, limit: u32) bool {
+    if (layer_idx >= limit) return false;
     var nbuf: [128]u8 = undefined;
     const sf = iq3 orelse return false;
     return sf.lookup_optional(iq3_name(&nbuf, layer_idx, "codes")) != null;
@@ -947,6 +968,7 @@ fn compute_total_vram_bytes(
     has_ablation: bool,
     has_ablation_detectors: bool,
     iq3: ?*const safetensors.SafetensorsFile,
+    iq3_limit: u32,
 ) u64 {
     const a = constants.vram_alignment_bytes;
     var total: u64 = 0;
@@ -1026,7 +1048,7 @@ fn compute_total_vram_bytes(
         for (dims, 0..) |d, bank| {
             const rows: u64 = d[0];
             const cols: u64 = d[1];
-            if (bank == 0 and iq3_bank_present(iq3, l)) {
+            if (bank == 0 and iq3_bank_present(iq3, l, iq3_limit)) {
                 total += tiger.align_up_u64(constants.iq3_codes_bytes, a);
                 total += tiger.align_up_u64(constants.iq3_d_bytes, a);
                 total += tiger.align_up_u64(constants.expert_count * 4, a);

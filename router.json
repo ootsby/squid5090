@@ -1,6 +1,6 @@
 {
   "default": "inkling-2-mini",
-  "image": "squid5090:mixd512",
+  "image": "squid5090:f{batch}",
   "model_dir": "F:/squid/model",
   "volume": "squid-model",
   "ablation_file": "inkling-2-mini-abliterated.safetensors",
@@ -9,7 +9,9 @@
   "max_arena_gib": 14.5,
   "models": {
     "inkling-2-mini": { "ctx": 32768 },
+    "inkling-2-mini-quality": { "ctx": 32768, "mode": "f8" },
     "inkling-2-mini-64k": { "ctx": 65536 },
+    "inkling-2-mini-128k": { "ctx": 131072, "mode": "f18", "batch": 1024 },
     "inkling-2-mini-abliterated": { "ctx": 32768, "abl": true },
     "inkling-2-mini-abliterated-64k": { "ctx": 65536, "abl": true }
   }

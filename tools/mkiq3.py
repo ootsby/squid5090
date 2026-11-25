@@ -1,5 +1,6 @@
 """Extract IQ3_XXS w13 expert banks from a GGUF into iq3.safetensors, in the layout cuda/ reads (FMT 2).
-Usage: mkiq3.py REF.gguf MODEL_DIR     writes MODEL_DIR/iq3.safetensors, then checks it against the official weights.
+Usage: mkiq3.py REF.gguf MODEL_DIR [NAME]   writes MODEL_DIR/NAME (default iq3.safetensors = mix D; mix F uses iq3f.safetensors)
+and checks it against the official weights.
 Row (2304 weights, 864 B) = 18 chunks of 128: 32 grid-index bytes + 4 u32 (4x7-bit signs, 4-bit scale).
 d: one f16 per 256 weights, shifted by a per-expert power of two so products stay in FP16 range (undone in _scale)."""
 import json, os, sys
@@ -47,7 +48,7 @@ def official(mdir):
         return x.reshape(2304, 2304)
     return weight
 
-def main(ref, mdir):
+def main(ref, mdir, name='iq3.safetensors'):
     R = GGUFReader(ref); T = {t.name: t for t in R.tensors}
     layers = [l for l in range(24) if T[f'blk.{l}.ffn_gate_up_exps.weight'].tensor_type.name == 'IQ3_XXS']
     sizes = {'codes': ('U8', [128, 2304, 864]), 'd': ('F16', [128, 2304, 9]), 'scale': ('F32', [128])}
@@ -57,7 +58,7 @@ def main(ref, mdir):
             nb = int(np.prod(sh)) * {'U8': 1, 'F16': 2, 'F32': 4}[dt]
             hdr[f'model.llm.layers.{l}.mlp.experts.w13_iq3_{n}'] = {'dtype': dt, 'shape': sh, 'data_offsets': [off, off + nb]}; off += nb
     h = json.dumps(hdr, separators=(',', ':')).encode(); h += b' ' * (-len(h) % 8)
-    weight = official(mdir); out = f'{mdir}/iq3.safetensors'
+    weight = official(mdir); out = f'{mdir}/{name}'
     with open(out + '.tmp', 'wb') as f:
         f.write(len(h).to_bytes(8, 'little') + h)
         for l in layers:
@@ -72,4 +73,4 @@ def main(ref, mdir):
         assert f.tell() == 8 + len(h) + off
     os.replace(out + '.tmp', out); print(out, 8 + len(h) + off)
 
-if __name__ == '__main__': main(*sys.argv[1:3])
+if __name__ == '__main__': main(*sys.argv[1:4])
