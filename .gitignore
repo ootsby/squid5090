@@ -16,6 +16,7 @@ __pycache__/
 # Model weights & local data
 models/
 work/
+router-backend.log
 *.safetensors
 *.bin
 

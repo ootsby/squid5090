@@ -1,0 +1,15 @@
+{
+  "default": "inkling-2-mini",
+  "image": "squid5090:mixd512",
+  "model_dir": "F:/squid/model",
+  "ablation_file": "inkling-2-mini-abliterated.safetensors",
+  "backend_port": 8001,
+  "idle_unload_seconds": 900,
+  "max_arena_gib": 14.5,
+  "models": {
+    "inkling-2-mini": { "ctx": 32768 },
+    "inkling-2-mini-64k": { "ctx": 65536 },
+    "inkling-2-mini-abliterated": { "ctx": 32768, "abl": true },
+    "inkling-2-mini-abliterated-64k": { "ctx": 65536, "abl": true }
+  }
+}
