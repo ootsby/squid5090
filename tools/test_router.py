@@ -42,7 +42,9 @@ try:
     c = R.command(R.resolve('sq:mode=f8,batch=1024')); assert 'SQUID_IQ3=8' in c and 'x1024' in c and c[c.index('--mode') + 1] == 'mix'
     c = R.command(s); assert not any('SQUID_IQ3' in x for x in c) and 'x512' in c and c[c.index('--mode') + 1] == 'nvfp4'
     assert R.resolve('sq:mode=f18,ctx=131072,batch=1024')
-    assert R.resolve('sq:abl=0') == R.resolve('sq')
+    assert R.resolve('sq:abl=0') == R.resolve('sq') and R.resolve('sq:vision=0') == R.resolve('sq')
+    assert '--no-vision' in R.command(R.resolve('sq')) and '--no-vision' not in R.command(R.resolve('sq:vision,mode=f18'))
+    assert abs(R.arena_gib(R.resolve('sq:vision,mode=f18')) - R.arena_gib(R.resolve('sq:mode=f18')) - 0.60) < 1e-9
     for m in ('sq:ctx=1000', 'sq:ctx=x', 'sq:ctx=-1024', 'sq:mode=exact', 'sq:kv=q2', 'sq:mtp=9', 'sq:batch=2048', 'sq:mode=f9', 'sq:foo=1', 'sq:image=evil', 'a:abl'): fails(e(m), 400)
     assert 'GiB' in fails(e('sq:ctx=131072'), 400); fails(e('nope'), 404)
     # load, swap, reuse

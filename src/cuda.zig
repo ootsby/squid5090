@@ -11,6 +11,11 @@ pub const CSampleConfig = extern struct {
     seed: u64 = 0,
 };
 
+pub const CLoopCDConfig = extern struct {
+    omega: f32 = 0.0,
+    ref_pass: i32 = 1,
+};
+
 pub const CLinearWeight = extern struct {
     kind: u8 = 0,
     rows: i32 = 0,
@@ -70,6 +75,8 @@ pub const CDsparkWeights = extern struct {
     hidden_out_w: ?*anyopaque = null,
     hidden_out_b: ?*anyopaque = null,
     draft_vocab_size: i32 = 0,
+    draft_vocab_cap: i32 = 0,
+    d_draft_vocab_size: ?[*]i32 = null,
     draft_vocab_ids: ?[*]i32 = null,
     inv_draft_vocab_ids: ?[*]i32 = null,
     unembed_draft: CLinearWeight = .{},
@@ -351,6 +358,36 @@ pub extern "c" fn squid_launch_mega_attn_post_mlp_in(
     stream: ?*anyopaque,
 ) void;
 
+pub extern "c" fn squid_launch_attn_cluster_decode(
+    qrgs: [*]const f32,
+    k_proj: [*]const f32,
+    v_proj: [*]const f32,
+    in_k: ?[*]const f32,
+    in_v: ?[*]const f32,
+    k_sw: *const anyopaque,
+    v_sw: *const anyopaque,
+    k_sp: ?*const anyopaque,
+    v_sp: ?*const anyopaque,
+    k_ring: [*]f32,
+    v_ring: [*]f32,
+    q_cs: *const anyopaque,
+    r_cs: *const anyopaque,
+    rel_proj: *const anyopaque,
+    k_cache: *anyopaque,
+    v_cache: *anyopaque,
+    k_scale: ?*anyopaque,
+    v_scale: ?*anyopaque,
+    kv_fmt: u8,
+    split_buf: [*]f32,
+    out_gated: ?[*]f32,
+    out_gated_h: ?*anyopaque,
+    kv_cap: i32,
+    is_global: u8,
+    batch_size: i32,
+    d_pos: *const i32,
+    stream: ?*anyopaque,
+) void;
+
 pub extern "c" fn squid_launch_route_topk_nvfp4(
     m_h: *const anyopaque,
     router_nvfp4: *const CLinearWeight,
@@ -365,6 +402,7 @@ pub extern "c" fn squid_launch_route_topk_nvfp4(
 
 pub extern "c" fn squid_launch_route_topk(
     m: [*]const f32,
+    m_h: ?*const anyopaque,
     router_w: *const anyopaque,
     router_bias: [*]const f32,
     scratch_logits: [*]f32,
@@ -403,11 +441,20 @@ pub extern "c" fn squid_launch_mega_mlp_post_res(
     mlp_ring: [*]f32,
     residual: [*]const f32,
     hidden_out: [*]f32,
+    loopcd_save_out: ?[*]f32,
     batch_size: i32,
     d_pos: *const i32,
     abl_r: ?[*]const f32,
     abl_d: ?[*]const f32,
     abl_p: ?[*]const f32,
+    stream: ?*anyopaque,
+) void;
+
+pub extern "c" fn squid_launch_loopcd_hidden_apply(
+    hidden: [*]f32,
+    ref_hidden: [*]const f32,
+    omega: f32,
+    batch_size: i32,
     stream: ?*anyopaque,
 ) void;
 
@@ -439,6 +486,9 @@ pub extern "c" fn squid_launch_mega_mlp_post_next_depth_norm(
     abl_r: ?[*]const f32,
     abl_d: ?[*]const f32,
     abl_p: ?[*]const f32,
+    loopcd_h1: ?[*]const f32,
+    loopcd_h2: ?[*]const f32,
+    loopcd_cfg: ?*const CLoopCDConfig,
     stream: ?*anyopaque,
 ) void;
 
@@ -523,6 +573,17 @@ pub extern "c" fn squid_adaptive_graph_branch_end(stream: ?*anyopaque) i32;
 pub extern "c" fn squid_adaptive_graph_instantiate(graph: ?*anyopaque) i32;
 pub extern "c" fn squid_adaptive_graph_launch(graph: ?*anyopaque, stream: ?*anyopaque) i32;
 pub extern "c" fn squid_adaptive_graph_destroy(graph: ?*anyopaque) i32;
+
+pub extern "c" fn squid_launch_dspark_gather_shortlist(
+    unembed: *const CLinearWeight,
+    unembed_draft: *const CLinearWeight,
+    draft_vocab_ids: [*]i32,
+    d_draft_vocab_size: ?*i32,
+    d_new_ids: ?[*]const i32,
+    dst_offset: i32,
+    count: i32,
+    stream: ?*anyopaque,
+) void;
 
 pub extern "c" fn squid_launch_spec_verify(
     target_preds: [*]const i32,
@@ -658,6 +719,7 @@ pub extern "c" fn squid_launch_prefill_flash_attn_tc(
     v_scale: ?*const anyopaque,
     kv_fmt: u8,
     out_gated_h: *anyopaque,
+    scratch_rel: ?*anyopaque,
     kv_cap: i32,
     window: i32,
     batch_size: i32,
@@ -705,6 +767,7 @@ pub extern "c" fn squid_launch_prefill_moe_gate_up_h(
     sorted_tok: [*]const i32,
     sorted_slot: [*]const i32,
     out_act_h: *anyopaque,
+    scratch_q: ?*anyopaque,
     batch_size: i32,
     stream: ?*anyopaque,
 ) void;
@@ -717,6 +780,88 @@ pub extern "c" fn squid_launch_prefill_moe_down_h(
     sorted_slot: [*]const i32,
     sorted_w: [*]const f32,
     out_slots: [*]f32,
+    scratch_q: ?*anyopaque,
     batch_size: i32,
+    stream: ?*anyopaque,
+) void;
+
+pub const CVisionLayerWeights = extern struct {
+    ln1_w: ?[*]const f32 = null,
+    ln1_b: ?[*]const f32 = null,
+    ln2_w: ?[*]const f32 = null,
+    ln2_b: ?[*]const f32 = null,
+    ls1: ?[*]const f32 = null,
+    ls2: ?[*]const f32 = null,
+    wqkv: ?*const anyopaque = null,
+    bqkv: ?[*]const f32 = null,
+    wo: ?*const anyopaque = null,
+    bo: ?[*]const f32 = null,
+    fc: ?*const anyopaque = null,
+    bfc: ?[*]const f32 = null,
+    proj: ?*const anyopaque = null,
+    bproj: ?[*]const f32 = null,
+};
+
+pub const CVisionWeights = extern struct {
+    loaded: u8 = 0,
+    patch_w: ?*const anyopaque = null,
+    pos: ?[*]const f32 = null,
+    cls: ?[*]const f32 = null,
+    ln_pre_w: ?[*]const f32 = null,
+    ln_pre_b: ?[*]const f32 = null,
+    proj_in: ?*const anyopaque = null,
+    proj_out: ?*const anyopaque = null,
+    inv_freq: ?[*]const f32 = null,
+    layers: [constants.vision_layer_count]CVisionLayerWeights = @splat(.{}),
+};
+
+pub const CDecodedImage = extern struct {
+    width: i32 = 0,
+    height: i32 = 0,
+    tokens: i32 = 0,
+    hash: u64 = 0,
+    rgb: ?[*]u8 = null,
+};
+
+pub extern "c" fn squid_image_token_id(hash: u64, k: i32) i32;
+pub extern "c" fn squid_image_free(img: *CDecodedImage) void;
+pub extern "c" fn squid_image_decode_bytes(data: [*]const u8, len: usize, max_tokens: i32, out_img: *CDecodedImage) i32;
+pub extern "c" fn squid_image_decode_base64(b64: [*]const u8, b64_len: usize, max_tokens: i32, out_img: *CDecodedImage) i32;
+pub extern "c" fn squid_image_decode_data_uri(uri: [*]const u8, uri_len: usize, max_tokens: i32, out_img: *CDecodedImage) i32;
+
+pub extern "c" fn squid_launch_vision_encode(
+    vw_in: *const CVisionWeights,
+    rgb_host: [*]const u8,
+    height: i32,
+    width: i32,
+    out_bf16_dev: *anyopaque,
+    stream: ?*anyopaque,
+) void;
+
+pub extern "c" fn squid_launch_scatter_image_embeds(
+    src_bf16: *const anyopaque,
+    dst_hidden: [*]f32,
+    dst_offset: i32,
+    count: i32,
+    stream: ?*anyopaque,
+) void;
+
+pub extern "c" fn squid_launch_prefill_dspark_commit(
+    dw_in: *const CDsparkWeights,
+    taps: [*]const f32,
+    ctx_k: [*]const ?*anyopaque,
+    ctx_v: [*]const ?*anyopaque,
+    ctx_ks: [*]const ?*anyopaque,
+    ctx_vs: [*]const ?*anyopaque,
+    ctx_cap: [*]const i32,
+    global_kv_fmt: u8,
+    f_ring: [*]f32,
+    mix_h0: *anyopaque,
+    mix_h1: *anyopaque,
+    mix_h2: *anyopaque,
+    scratch_kv: [*]f32,
+    w_f16_scratch: *anyopaque,
+    batch_size: i32,
+    d_pos: *const i32,
     stream: ?*anyopaque,
 ) void;

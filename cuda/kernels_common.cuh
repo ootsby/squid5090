@@ -6,6 +6,8 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <utility>
 
 namespace squid {
@@ -13,8 +15,24 @@ namespace squid {
 // ============================================================================
 // Blackwell Programmatic Dependent Launch (PDL) & Streaming Weight Load Primitives
 // Adapted from satellitedown/inkling-2-mini-abliterated-ingine (Apache-2.0).
-// Note: L2::cache_hint is intentionally omitted on CUDA 13.1 due to ptxas 13.1 bug.
+// Uses L2::evict_first cache hints automatically on CUDA 13.4+ (ptxas 13.1 bug avoided).
 // ============================================================================
+
+#if defined(__CUDACC_VER_MAJOR__) && ((__CUDACC_VER_MAJOR__ > 13) || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+#define SQUID_HAS_L2_HINT 1
+#else
+#define SQUID_HAS_L2_HINT 0
+#endif
+
+__device__ __forceinline__ uint64_t l2_policy_evict_first() {
+#if SQUID_HAS_L2_HINT && (__CUDA_ARCH__ >= 900)
+    unsigned long long pol;
+    asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+    return static_cast<uint64_t>(pol);
+#else
+    return 0ull;
+#endif
+}
 
 __device__ __forceinline__ void pdl_wait() {
 #if __CUDA_ARCH__ >= 900
@@ -53,7 +71,7 @@ inline void launch_pdl(void (*kernel)(KArgs...), dim3 grid, int block, cudaStrea
     CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...));
 }
 
-__device__ __forceinline__ uint4 ld_stream_u4(const void* p) {
+__device__ __forceinline__ uint4 ld_stream_u4_nohint(const void* p) {
     uint4 v;
     asm volatile("ld.global.nc.L1::no_allocate.L2::256B.v4.u32 {%0,%1,%2,%3}, [%4];"
                  : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
@@ -61,11 +79,33 @@ __device__ __forceinline__ uint4 ld_stream_u4(const void* p) {
     return v;
 }
 
+__device__ __forceinline__ uint4 ld_stream_u4(const void* p) {
+    uint4 v;
+#if SQUID_HAS_L2_HINT && (__CUDA_ARCH__ >= 900)
+    const uint64_t pol = l2_policy_evict_first();
+    asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.L2::256B.v4.u32 {%0,%1,%2,%3}, [%4], %5;"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(p), "l"(pol));
+#else
+    asm volatile("ld.global.nc.L1::no_allocate.L2::256B.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(p));
+#endif
+    return v;
+}
+
 __device__ __forceinline__ uint2 ld_stream_u2(const void* p) {
     uint2 v;
+#if SQUID_HAS_L2_HINT && (__CUDA_ARCH__ >= 900)
+    const uint64_t pol = l2_policy_evict_first();
+    asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.L2::256B.v2.u32 {%0,%1}, [%2], %3;"
+                 : "=r"(v.x), "=r"(v.y)
+                 : "l"(p), "l"(pol));
+#else
     asm volatile("ld.global.nc.L1::no_allocate.L2::256B.v2.u32 {%0,%1}, [%2];"
                  : "=r"(v.x), "=r"(v.y)
                  : "l"(p));
+#endif
     return v;
 }
 
@@ -77,13 +117,23 @@ __device__ __forceinline__ uint32_t ld_stream_u32(const void* p) {
 
 __device__ __forceinline__ uint16_t ld_scale_u16(const void* p) {
     uint16_t v;
+#if SQUID_HAS_L2_HINT && (__CUDA_ARCH__ >= 900)
+    const uint64_t pol = l2_policy_evict_first();
+    asm volatile("ld.global.nc.L2::cache_hint.u16 %0, [%1], %2;" : "=h"(v) : "l"(p), "l"(pol));
+#else
     asm volatile("ld.global.nc.u16 %0, [%1];" : "=h"(v) : "l"(p));
+#endif
     return v;
 }
 
 __device__ __forceinline__ uint8_t ld_scale_u8(const void* p) {
     uint16_t v;
+#if SQUID_HAS_L2_HINT && (__CUDA_ARCH__ >= 900)
+    const uint64_t pol = l2_policy_evict_first();
+    asm volatile("ld.global.nc.L2::cache_hint.u8 %0, [%1], %2;" : "=h"(v) : "l"(p), "l"(pol));
+#else
     asm volatile("ld.global.nc.u8 %0, [%1];" : "=h"(v) : "l"(p));
+#endif
     return static_cast<uint8_t>(v);
 }
 
@@ -152,6 +202,15 @@ __device__ __forceinline__ uint32_t iq3_signs(uint32_t ss, int l) {
 __device__ __forceinline__ __half2 iq3_scale(uint16_t d, uint32_t ss) {
     const float db = __half2float(*reinterpret_cast<const __half*>(&d)) * (0.25f + 0.5f * float(ss >> 28));
     return __floats2half2_rn(db, db);
+}
+
+__device__ __forceinline__ float4 ld_dep_f4(const float* p) {
+    float4 v;
+    asm volatile("ld.global.v4.f32 {%0,%1,%2,%3}, [%4];"
+                 : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w)
+                 : "l"(p)
+                 : "memory");
+    return v;
 }
 
 __device__ __forceinline__ void mma_m16n8k16_f32_bf16(
@@ -733,9 +792,10 @@ __device__ __forceinline__ void run_tc_bulk_splitk(
     }
 }
 
-// Stateless SplitMix64 uniform (0, 1) and Gumbel(0, 1) noise helpers for CUDA-graph sampling.
-// Strictly inside [2^-24, 1 - 2^-24] in float32 -> never produces 0.0f, 1.0f, NaN, or Inf.
-__device__ __forceinline__ float hash_u01(uint64_t seed, int32_t pos, int32_t tok) {
+// Stateless SplitMix64 uniform (0, 1) and full-64-bit Gumbel(0, 1) noise helpers for CUDA-graph sampling.
+// 64-bit floating-point Gumbel technique adapted from satellitedown/inkling-2-mini-abliterated-ingine (Apache-2.0):
+// keeps 24 significant bits down to 2^-64 so far-tail tokens (down to ~e^-44) sample accurately without Inf/NaN.
+__device__ __forceinline__ uint64_t hash_u64(uint64_t seed, int32_t pos, int32_t tok) {
     uint64_t h = seed ^ ((uint64_t)(uint32_t)pos * 0x9E3779B97F4A7C15ULL)
                       ^ ((uint64_t)(uint32_t)tok * 0xBF58476D1CE4E5B9ULL);
     h ^= h >> 30;
@@ -743,11 +803,188 @@ __device__ __forceinline__ float hash_u01(uint64_t seed, int32_t pos, int32_t to
     h ^= h >> 27;
     h *= 0x94D049BB133111EBULL;
     h ^= h >> 31;
+    return h;
+}
+
+__device__ __forceinline__ float hash_u01(uint64_t seed, int32_t pos, int32_t tok) {
+    uint64_t h = hash_u64(seed, pos, tok);
     return ((float)(h >> 41) + 0.5f) * (1.0f / 8388608.0f);
 }
 
 __device__ __forceinline__ float hash_gumbel(uint64_t seed, int32_t pos, int32_t tok) {
-    return -__logf(-__logf(hash_u01(seed, pos, tok)));
+    uint64_t k = hash_u64(seed, pos, tok);
+    int z = min(__clzll(static_cast<long long>(k)), 40);
+    float m = static_cast<float>(static_cast<uint32_t>(k >> (40 - z))) + (z == 40 ? 0.5f : 0.0f);
+    float v = m * __int_as_float((127 - 24 - z) << 23); // strictly in (0, 1)
+    float e = (v < 0.5f) ? -log1pf(-v) : -logf(1.0f - v);
+    return -logf(e);
+}
+
+// Blackwell / Hopper Thread-Block Cluster + DSMEM mbarrier primitives (CUDA 13.1+ sm_120a safe).
+// Adapted from satellitedown/inkling-2-mini-abliterated-ingine (Apache-2.0).
+__device__ __forceinline__ uint32_t cluster_smem_u32(const void* p) {
+    return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+
+__device__ __forceinline__ uint32_t cluster_remote_u32(uint32_t addr, int dst_rank) {
+    uint32_t r;
+    asm("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(r) : "r"(addr), "r"(dst_rank));
+    return r;
+}
+
+__device__ __forceinline__ void cluster_mb_init(uint32_t mb) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(mb) : "memory");
+}
+
+__device__ __forceinline__ void cluster_fence_mb_init() {
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+}
+
+__device__ __forceinline__ void cluster_mb_expect_tx(uint32_t mb, uint32_t bytes) {
+    asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
+                 :: "r"(mb), "r"(bytes) : "memory");
+}
+
+__device__ __forceinline__ void cluster_mb_wait(uint32_t mb, uint32_t parity = 0u) {
+    uint32_t done = 0u;
+    while (!done) {
+        asm volatile("{\n.reg .pred p;\n"
+                     "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%1], %2;\n"
+                     "selp.b32 %0, 1, 0, p;\n}"
+                     : "=r"(done) : "r"(mb), "r"(parity) : "memory");
+    }
+}
+
+__device__ __forceinline__ void cluster_arrive_relaxed() {
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+}
+
+__device__ __forceinline__ void cluster_wait_acquire() {
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+}
+
+__device__ __forceinline__ void cluster_st_async_f4(uint32_t dst_addr, float4 v, uint32_t remote_mb) {
+    asm volatile("st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.f32 [%0], {%1,%2,%3,%4}, [%5];"
+                 :: "r"(dst_addr), "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w), "r"(remote_mb) : "memory");
+}
+
+__device__ __forceinline__ void cp_async16_cg(void* smem_dst, const void* gmem_src) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
+                 :: "r"(cluster_smem_u32(smem_dst)), "l"(gmem_src) : "memory");
+}
+
+// Single-barrier multi-value warp reduce-scatter & block reduction (adapted from ingine dense.cuh/reduce.cuh, Apache-2.0).
+constexpr int pow2_ceil_const(int n) { return (n <= 1) ? 1 : (2 * pow2_ceil_const((n + 1) / 2)); }
+
+template <int N>
+__device__ __forceinline__ float warp_reduce_scatter(const float (&in)[N]) {
+    constexpr int P = pow2_ceil_const(N);
+    static_assert(P <= 32, "more values than warp lanes");
+    const int lane = threadIdx.x & 31;
+    float t[P];
+    #pragma unroll
+    for (int i = 0; i < P; ++i) t[i] = (i < N) ? in[i] : 0.0f;
+    #pragma unroll
+    for (int o = 16; o >= P; o >>= 1) {
+        #pragma unroll
+        for (int i = 0; i < P; ++i) t[i] += __shfl_xor_sync(0xffffffffu, t[i], o);
+    }
+    #pragma unroll
+    for (int o = P / 2; o >= 1; o >>= 1) {
+        const bool up = (lane & o) != 0;
+        #pragma unroll
+        for (int i = 0; i < o; ++i) {
+            const float send = up ? t[i] : t[i + o];
+            const float keep = up ? t[i + o] : t[i];
+            t[i] = keep + __shfl_xor_sync(0xffffffffu, send, o);
+        }
+    }
+    return t[0];
+}
+
+template <int N, int NW>
+__device__ __forceinline__ void block_sum_bcast(float (&v)[N], float* scratch) {
+    static_assert(N <= 32, "at most 32 values");
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if constexpr (N < 6) {
+        #pragma unroll
+        for (int i = 0; i < N; ++i) v[i] = warp_sum(v[i]);
+        if (lane < N) {
+            float mine = v[0];
+            #pragma unroll
+            for (int i = 1; i < N; ++i) mine = (lane == i) ? v[i] : mine;
+            scratch[warp * 32 + lane] = mine;
+        }
+    } else {
+        const float part = warp_reduce_scatter<N>(v);
+        if (lane < pow2_ceil_const(N)) scratch[warp * 32 + lane] = part;
+    }
+    __syncthreads();
+    float s = 0.0f;
+    if (lane < N) {
+        #pragma unroll
+        for (int w = 0; w < NW; ++w) s += scratch[w * 32 + lane];
+    }
+    #pragma unroll
+    for (int i = 0; i < N; ++i) v[i] = __shfl_sync(0xffffffffu, s, i);
+}
+
+template <class... KArgs, class... Args>
+inline void launch_pdl_cluster(
+    void (*kernel)(KArgs...), dim3 grid, int block, int smem_bytes, int cluster_x,
+    cudaStream_t stream, Args&&... args) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = grid;
+    cfg.blockDim = dim3(block);
+    cfg.dynamicSmemBytes = static_cast<size_t>(smem_bytes);
+    cfg.stream = stream;
+    cudaLaunchAttribute attr[2];
+    int n_attr = 0;
+    attr[n_attr].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[n_attr].val.programmaticStreamSerializationAllowed = 1;
+    ++n_attr;
+    if (cluster_x > 1) {
+        attr[n_attr].id = cudaLaunchAttributeClusterDimension;
+        attr[n_attr].val.clusterDim.x = static_cast<unsigned int>(cluster_x);
+        attr[n_attr].val.clusterDim.y = 1u;
+        attr[n_attr].val.clusterDim.z = 1u;
+        ++n_attr;
+    }
+    cfg.attrs = attr;
+    cfg.numAttrs = n_attr;
+    CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...));
+}
+
+// Upstream sizes some clusters at 16 CTAs for the RTX 5090; smaller cards (RTX 5070 Ti) refuse to launch them.
+// Callers check once per kernel and fall back to their pre-cluster kernels. SQUID_NO_CLUSTER=1 forces the fallback.
+template <class... KArgs>
+inline bool cluster_fits(void (*kernel)(KArgs...), int block, int smem_bytes, int cluster_x) {
+    static const bool forced_off = [] { const char* e = getenv("SQUID_NO_CLUSTER"); return e && e[0] == '1'; }();
+    int n = 0;
+    if (!forced_off) {
+        cudaLaunchConfig_t cfg = {};
+        cfg.gridDim = dim3(cluster_x);
+        cfg.blockDim = dim3(block);
+        cfg.dynamicSmemBytes = static_cast<size_t>(smem_bytes);
+        cudaLaunchAttribute a;
+        a.id = cudaLaunchAttributeClusterDimension;
+        a.val.clusterDim.x = static_cast<unsigned int>(cluster_x);
+        a.val.clusterDim.y = 1u;
+        a.val.clusterDim.z = 1u;
+        cfg.attrs = &a;
+        cfg.numAttrs = 1;
+        if (cudaOccupancyMaxActiveClusters(&n, kernel, &cfg) != cudaSuccess) {
+            (void)cudaGetLastError();
+            n = 0;
+        }
+    }
+    static bool noted = false;
+    if (n == 0 && !noted) {
+        noted = true;
+        fprintf(stderr, "[cuda] %d-CTA cluster kernel not supported here: using the pre-cluster kernels\n", cluster_x);
+    }
+    return n > 0;
 }
 
 } // namespace squid

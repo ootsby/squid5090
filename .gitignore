@@ -19,6 +19,7 @@ work/
 router-backend.log
 *.safetensors
 *.bin
+!src/draft_shortlist.bin
 
 # OS / editor noise
 .DS_Store

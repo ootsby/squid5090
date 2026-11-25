@@ -31,11 +31,11 @@ def runtime(ctx,f,mtp,pb):
     t=0
     for v in range(48):
         l=v if v<6 else (6+(v-6)%12 if v<42 else v-24)
-        g=glob(l); t+=kv(ctx if g else 1280,f if g else 'bf16')+2*A(16*KV*4)+2*A(16*H*4)
+        g=glob(l); t+=kv(ctx if g else 1024+max(512,pb//4),f if g else 'bf16')+2*A(16*KV*4)+2*A(16*H*4)
     if mtp: t+=2*kv(1032,'bf16')+kv(65536 if ctx>524288 else ctx,f)+A(16*H*4)
     t+=A(2050000*4); b=8
-    t+=b*H*4*(3+4+2+3+4+3+6+1+8+4+3)+b*H*2*5+b*QR*4+2*b*KV*4+b*Q*6+3*b*64*4+b*128*4+b*I*8*2+b*2*KV*4+8000000+2*b*4096+(b+7)*VU*4
-    t+=pb*H*4*(3+4+2+3+4+8+4+1)+pb*H*2*(3+1+2)+pb*QR*4+2*pb*KV*4+pb*Q*2+pb*128*4+pb*8*4*5+pb*8*I*2+QR*H*2+pb*64*6
+    t+=b*H*4*(3+4+2+3+4+3+6+1+8+4+3)+b*H*2*5+b*QR*4+2*b*KV*4+b*Q*6+3*b*64*4+b*128*4+b*I*8*2+b*2*KV*4+12800000+2*b*4096+(b+7)*VU*4+2*b*H*4+16384*4
+    t+=pb*H*4*(3+4+2+3+4+8+4+1)+pb*H*2*(3+1+2)+pb*QR*4+2*pb*KV*4+pb*Q*2+pb*128*4+pb*8*4*5+pb*8*I*2+QR*H*2+pb*64*6+pb*H*4
     return t
 LAYER=128*(2*I*H+H*I)*9//16   # one NVFP4 layer's experts
 if __name__=='__main__':
@@ -43,7 +43,8 @@ if __name__=='__main__':
     for args,want in((('exact',0,1,0),18.28),(('fp8',0,1,32768),16.85),(('nvfp4',0,1,32768),14.57),(('nvfp4',1,1,32768),13.70)):
         assert round(weights(*args)/G,2)==want,args
     w=weights('nvfp4',1,1,32768)
-    assert round((w+runtime(1048576,'q4',1,2048))/G,2)==23.23
+    # runtime arena measured on the 5070 Ti after the upstream 124afb8 merge
+    assert round(runtime(32768,'q4',1,512)/G,2)==0.80 and round(runtime(131072,'q4',1,1024)/G,2)==1.87
     print('nvfp4 + q4 KV + host embed + MTP, arena GiB')
     print('load peak (weights + staging):',round((w+VU*H*2)/G,2))
     print('prefill     ctx  off=0  off=1  off=2')

@@ -45,11 +45,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var top_p: f32 = 0.95;
     var top_k: i32 = 0;
     var seed: u64 = 0;
+    var loopcd_omega: f32 = 0.0;
+    var loopcd_ref: i32 = 1;
     var max_tokens: u32 = 128;
     var runs: u32 = 6;
     var ctx: u32 = if (std.mem.eql(u8, command, "serve")) 65536 else 8192;
     var use_graphs: bool = true;
-    var use_prompt_lookup: bool = true;
+    var use_prompt_lookup: bool = false;
+    var load_vision: bool = std.mem.eql(u8, command, "serve");
+    var image_max_tokens: u32 = constants.vision_max_tokens_default;
+    var max_images: u32 = constants.vision_max_images_default;
     var embed_on_host: bool = false;
     var raw_prompt: bool = false;
     var raw_thinking: bool = false;
@@ -125,6 +130,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.eql(u8, arg, "--seed") and arg_i + 1 < argv.len) {
             arg_i += 1;
             seed = std.fmt.parseInt(u64, std.mem.span(argv[arg_i]), 10) catch 0;
+        } else if (std.mem.eql(u8, arg, "--loopcd-omega") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            const v = std.fmt.parseFloat(f32, std.mem.span(argv[arg_i])) catch 0.0;
+            loopcd_omega = if (std.math.isFinite(v) and v >= -1.0 and v <= 2.0) v else 0.0;
+        } else if (std.mem.eql(u8, arg, "--loopcd-ref") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            const v = std.fmt.parseInt(i32, std.mem.span(argv[arg_i]), 10) catch 1;
+            loopcd_ref = if (v == 2) 2 else 1;
         } else if (std.mem.eql(u8, arg, "--max-tokens") and arg_i + 1 < argv.len) {
             arg_i += 1;
             max_tokens = std.fmt.parseInt(u32, std.mem.span(argv[arg_i]), 10) catch 128;
@@ -138,8 +151,20 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             embed_on_host = true;
         } else if (std.mem.eql(u8, arg, "--no-graph")) {
             use_graphs = false;
+        } else if (std.mem.eql(u8, arg, "--prompt-lookup")) {
+            use_prompt_lookup = true;
         } else if (std.mem.eql(u8, arg, "--no-prompt-lookup")) {
             use_prompt_lookup = false;
+        } else if (std.mem.eql(u8, arg, "--no-vision")) {
+            load_vision = false;
+        } else if (std.mem.eql(u8, arg, "--image-max-tokens") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            const v = std.fmt.parseInt(u32, std.mem.span(argv[arg_i]), 10) catch constants.vision_max_tokens_default;
+            image_max_tokens = @max(@as(u32, 1), @min(v, constants.vision_max_tokens_default));
+        } else if (std.mem.eql(u8, arg, "--max-images") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            const v = std.fmt.parseInt(u32, std.mem.span(argv[arg_i]), 10) catch constants.vision_max_images_default;
+            max_images = @max(@as(u32, 1), @min(v, constants.vision_max_images_default));
         } else if (std.mem.eql(u8, arg, "--raw")) {
             raw_prompt = true;
         } else if (std.mem.eql(u8, arg, "--raw-thinking")) {
@@ -261,7 +286,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     var model_weights: weights_mod.ModelWeights = .{};
     const load_mtp: bool = (mtp > 0 or std.mem.eql(u8, command, "bench") or std.mem.eql(u8, command, "longctx") or std.mem.eql(u8, command, "serve"));
-    if (!model_weights.load(model_directory, quant_mode, load_mtp, embed_on_host, ablation_path)) return 1;
+    if (!model_weights.load(model_directory, quant_mode, load_mtp, embed_on_host, ablation_path, load_vision)) return 1;
     defer model_weights.deinit();
 
     var engine: engine_mod.Engine = .{};
@@ -273,6 +298,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .top_p = top_p,
         .top_k = top_k,
         .seed = if (seed != 0) seed else tiger.clock_monotonic_ns(),
+        .loopcd_omega = loopcd_omega,
+        .loopcd_ref = loopcd_ref,
     };
     defer engine.deinit();
 
@@ -287,9 +314,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             .default_temperature = temperature,
             .default_top_p = top_p,
             .default_top_k = top_k,
+            .default_loopcd_omega = loopcd_omega,
+            .default_loopcd_ref = loopcd_ref,
             .context_tokens_max = ctx,
             .raw_thinking = raw_thinking,
             .keep_history_thinking = keep_history_thinking,
+            .vision_enabled = (model_weights.vision.loaded != 0),
+            .image_max_tokens = image_max_tokens,
+            .max_images = max_images,
         });
     }
 
@@ -669,12 +701,12 @@ fn print_usage() void {
     tiger.write_fd_all(2,
         "squid5090 — TigerStyle Zig + Blackwell CUDA Inference Engine & OpenAI Server for Inkling-2-Mini\n\n" ++
             "Usage:\n" ++
-            "  squid5090 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode fp8|nvfp4|exact] [--kv auto|bf16|fp8|q4] [--ctx 65536] [--mtp 7] [--spec-threshold 0.80] [--temp 1.0] [--top-p 0.95] [--top-k 0] [--keep-history-thinking] [--ablation PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY]\n" ++
-            "  squid5090 generate <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV | --tokens-file PATH) [--mode exact] [--kv auto] [--mtp 0] [--spec-threshold 0.80] [--temp 0.0] [--top-p 0.95] [--top-k 0] [--seed N] [--ablation PATH] [--max-tokens 128] [--ctx 8192]\n" ++
-            "  squid5090 bench    <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV) [--mode exact] [--kv auto] [--mtp 0] [--spec-threshold 0.80] [--temp 0.0] [--top-p 0.95] [--ablation PATH] [--max-tokens 128] [--runs 6] [--ctx 8192]\n" ++
+            "  squid5090 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode fp8|nvfp4|exact] [--kv auto|bf16|fp8|q4] [--ctx 65536] [--mtp 7] [--spec-threshold 0.80] [--temp 1.0] [--top-p 0.95] [--top-k 0] [--loopcd-omega 0.0] [--loopcd-ref 1|2] [--keep-history-thinking] [--no-vision] [--image-max-tokens 4096] [--max-images 16] [--ablation PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY]\n" ++
+            "  squid5090 generate <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV | --tokens-file PATH) [--mode exact] [--kv auto] [--mtp 0] [--spec-threshold 0.80] [--temp 0.0] [--top-p 0.95] [--top-k 0] [--seed N] [--loopcd-omega 0.0] [--loopcd-ref 1|2] [--ablation PATH] [--max-tokens 128] [--ctx 8192]\n" ++
+            "  squid5090 bench    <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV) [--mode exact] [--kv auto] [--mtp 0] [--spec-threshold 0.80] [--temp 0.0] [--top-p 0.95] [--loopcd-omega 0.0] [--loopcd-ref 1|2] [--ablation PATH] [--max-tokens 128] [--runs 6] [--ctx 8192]\n" ++
             "  squid5090 longctx  <model_dir> [--mode exact|fp8|nvfp4] [--kv fp8|q4|bf16] [--ctx 1048576]\n" ++
-            "  squid5090 logits   <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --out FILE [--mode exact] [--kv bf16] [--ctx 8192]\n" ++
-            "  squid5090 kld      <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --ref FILE [--mode exact|fp8|nvfp4] [--kv auto|bf16|fp8|q4] [--ctx 8192]\n" ++
+            "  squid5090 logits   <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --out FILE [--mode exact] [--kv bf16] [--loopcd-omega 0.0] [--loopcd-ref 1|2] [--ctx 8192]\n" ++
+            "  squid5090 kld      <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --ref FILE [--mode exact|fp8|nvfp4] [--kv auto|bf16|fp8|q4] [--loopcd-omega 0.0] [--loopcd-ref 1|2] [--ctx 8192]\n" ++
             "  squid5090 tokenize <model_dir> (--prompt TEXT | --prompt-file PATH) [--raw]\n",
     );
 }

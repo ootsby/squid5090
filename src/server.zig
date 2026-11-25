@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const constants = @import("constants.zig");
+const cuda = @import("cuda.zig");
 const engine_mod = @import("engine.zig");
 const tiger = @import("tiger.zig");
 const tokenizer_mod = @import("tokenizer.zig");
@@ -40,9 +41,14 @@ pub const ServerConfig = struct {
     default_temperature: f32 = 1.0,
     default_top_p: f32 = 0.95,
     default_top_k: i32 = 0,
+    default_loopcd_omega: f32 = 0.0,
+    default_loopcd_ref: i32 = 1,
     context_tokens_max: u32 = 65536,
     raw_thinking: bool = false,
     keep_history_thinking: bool = false,
+    vision_enabled: bool = false,
+    image_max_tokens: u32 = constants.vision_max_tokens_default,
+    max_images: u32 = constants.vision_max_images_default,
 };
 
 const StopList = struct {
@@ -80,6 +86,84 @@ const ToolCallRecord = struct {
     args_len: usize = 0,
 };
 
+const ToolCallIdEntry = struct {
+    gen: u32 = 0,
+    hash: u64 = 0,
+    id_raw: []const u8 = "",
+    name_raw: []const u8 = "",
+};
+
+const ToolCallIdMap = struct {
+    const cap: usize = 16384;
+    const mask: usize = cap - 1;
+    entries: []ToolCallIdEntry,
+    gen: u32 = 1,
+
+    fn init() ToolCallIdMap {
+        return .{ .entries = tiger.alloc_host_zeroed(ToolCallIdEntry, cap), .gen = 1 };
+    }
+
+    fn deinit(self: *ToolCallIdMap) void {
+        tiger.free_host_slice(ToolCallIdEntry, self.entries);
+    }
+
+    fn clear(self: *ToolCallIdMap) void {
+        self.gen +%= 1;
+        if (self.gen == 0) {
+            for (self.entries) |*e| e.gen = 0;
+            self.gen = 1;
+        }
+    }
+
+    fn insert(self: *ToolCallIdMap, id_unescaped: []const u8, id_raw: []const u8, name_raw: []const u8) void {
+        if (id_unescaped.len == 0 or name_raw.len == 0) return;
+        const h = tiger.hash_bytes_u64(id_unescaped);
+        var slot: usize = @intCast(h & mask);
+        var probe: usize = 0;
+        var tmp_buf: [128]u8 = undefined;
+        while (probe < 64) : (probe += 1) {
+            const e = &self.entries[slot];
+            if (e.gen != self.gen) {
+                e.* = .{ .gen = self.gen, .hash = h, .id_raw = id_raw, .name_raw = name_raw };
+                return;
+            }
+            if (e.hash == h) {
+                var p: usize = 0;
+                if (tokenizer_mod.parse_json_string(e.id_raw, &p, &tmp_buf)) |existing_id| {
+                    if (std.mem.eql(u8, existing_id, id_unescaped)) {
+                        e.name_raw = name_raw;
+                        return;
+                    }
+                }
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    fn lookup(self: *const ToolCallIdMap, target_id: []const u8, out_buf: []u8) ?[]const u8 {
+        if (target_id.len == 0) return null;
+        const h = tiger.hash_bytes_u64(target_id);
+        var slot: usize = @intCast(h & mask);
+        var probe: usize = 0;
+        var tmp_buf: [128]u8 = undefined;
+        while (probe < 64) : (probe += 1) {
+            const e = self.entries[slot];
+            if (e.gen != self.gen) return null;
+            if (e.hash == h) {
+                var p: usize = 0;
+                if (tokenizer_mod.parse_json_string(e.id_raw, &p, &tmp_buf)) |existing_id| {
+                    if (std.mem.eql(u8, existing_id, target_id)) {
+                        var np: usize = 0;
+                        return tokenizer_mod.parse_json_string(e.name_raw, &np, out_buf);
+                    }
+                }
+            }
+            slot = (slot + 1) & mask;
+        }
+        return null;
+    }
+};
+
 /// Static preallocated host workspace owned by the server for its entire lifetime.
 const ServerBuffers = struct {
     request_buf: []u8,
@@ -92,6 +176,7 @@ const ServerBuffers = struct {
     scratch_str_buf: []u8,
     sse_buf: []u8,
     prompt_tokens: []i32,
+    tool_id_map: ToolCallIdMap,
     tok_scratch: tokenizer_mod.TokenizerScratch,
 
     fn init() ServerBuffers {
@@ -106,6 +191,7 @@ const ServerBuffers = struct {
             .scratch_str_buf = tiger.alloc_host_zeroed(u8, scratch_string_bytes),
             .sse_buf = tiger.alloc_host_zeroed(u8, sse_frame_bytes),
             .prompt_tokens = tiger.alloc_host_zeroed(i32, prompt_tokens_max),
+            .tool_id_map = ToolCallIdMap.init(),
             .tok_scratch = tokenizer_mod.TokenizerScratch.init(),
         };
     }
@@ -121,6 +207,7 @@ const ServerBuffers = struct {
         tiger.free_host_slice(u8, self.scratch_str_buf);
         tiger.free_host_slice(u8, self.sse_buf);
         tiger.free_host_slice(i32, self.prompt_tokens);
+        self.tool_id_map.deinit();
         self.tok_scratch.deinit();
     }
 };
@@ -543,7 +630,7 @@ fn handle_connection(
         var bw = tiger.ByteWriter.init(buffers.response_buf);
         bw.append_slice("{\"status\":\"ok\",\"model\":");
         bw.append_json_escaped(config.model_name);
-        bw.append_fmt(",\"max_context\":{d},\"mtp\":{d},\"engine\":\"squid5090\"}}", .{ config.context_tokens_max, config.default_mtp });
+        bw.append_fmt(",\"max_context\":{d},\"mtp\":{d},\"vision\":{s},\"engine\":\"squid5090\"}}", .{ config.context_tokens_max, config.default_mtp, if (config.vision_enabled) "true" else "false" });
         send_json_response(fd, 200, bw.slice());
         return;
     }
@@ -609,6 +696,8 @@ fn handle_chat_completions(
     var req_temp: f32 = config.default_temperature;
     var req_top_p: f32 = config.default_top_p;
     var req_top_k: i32 = config.default_top_k;
+    var req_loopcd_omega: f32 = config.default_loopcd_omega;
+    var req_loopcd_ref: i32 = config.default_loopcd_ref;
     var has_seed: bool = false;
     var req_seed: u64 = 0;
     var stream: bool = false;
@@ -619,7 +708,7 @@ fn handle_chat_completions(
     var key_buf: [128]u8 = undefined;
 
     var field_iter: u32 = 0;
-    while (pos < body.len and field_iter < 64) : (field_iter += 1) {
+    while (pos < body.len and field_iter < 256) : (field_iter += 1) {
         tokenizer_mod.skip_ws(body, &pos);
         if (pos < body.len and body[pos] == '}') break;
         const k = tokenizer_mod.parse_json_string(body, &pos, &key_buf) orelse {
@@ -686,6 +775,10 @@ fn handle_chat_completions(
             include_usage = extract_bool_field(body[start..pos], "include_usage");
         } else if (std.mem.eql(u8, k, "mtp")) {
             if (parse_json_i64_opt(body, &pos)) |v| req_mtp = clamp_i64_to_i32(v, 0, @intCast(constants.mtp_draft_count_max));
+        } else if (std.mem.eql(u8, k, "loopcd_omega")) {
+            if (parse_json_f64_opt(body, &pos)) |v| req_loopcd_omega = @floatCast(v);
+        } else if (std.mem.eql(u8, k, "loopcd_ref")) {
+            if (parse_json_i64_opt(body, &pos)) |v| req_loopcd_ref = if (v == 2) 2 else 1;
         } else if (std.mem.eql(u8, k, "stop")) {
             parse_stop_field(body, &pos, &stops);
         } else {
@@ -703,9 +796,18 @@ fn handle_chat_completions(
     if (!std.math.isFinite(req_temp) or req_temp < 0.0) req_temp = 0.0;
     if (!std.math.isFinite(req_top_p) or req_top_p <= 0.0 or req_top_p > 1.0) req_top_p = 1.0;
     if (req_top_k < 0) req_top_k = 0;
+    if (!std.math.isFinite(req_loopcd_omega) or req_loopcd_omega < -1.0 or req_loopcd_omega > 2.0) req_loopcd_omega = config.default_loopcd_omega;
+    if (req_loopcd_ref != 1 and req_loopcd_ref != 2) req_loopcd_ref = config.default_loopcd_ref;
     req_mtp = tiger.max_i32(0, tiger.min_i32(@intCast(constants.mtp_draft_count_max), req_mtp));
 
-    // Encode Inkling-2-Mini chat template directly into prompt_tokens:
+    var decoded_imgs: [constants.vision_max_images_default]cuda.CDecodedImage = @splat(.{});
+    var decoded_pos: [constants.vision_max_images_default]u32 = @splat(0);
+    var decoded_count: usize = 0;
+    defer {
+        for (decoded_imgs[0..decoded_count]) |*di| cuda.squid_image_free(di);
+    }
+
+    // Encode Inkling-2-Mini chat template directly into prompt_tokens (with optional multimodal image parts!):
     // server-emitted control tags use parse_special=true, while all untrusted user/tool/assistant text
     // uses parse_special=false (blocking control-token spoofing AND avoiding 32 MiB intermediate overflow!).
     const enc_res = encode_chat_template_zero_alloc(
@@ -713,14 +815,32 @@ fn handle_chat_completions(
         messages_json,
         tools_json,
         effort,
-        config.keep_history_thinking,
+        config,
         enable_thinking,
         buffers,
+        &decoded_imgs,
+        &decoded_pos,
+        &decoded_count,
     );
+    if (enc_res.img_error.len > 0) {
+        send_error_json(fd, 400, enc_res.img_error, "invalid_request_error", buffers.response_buf);
+        return;
+    }
     if (enc_res.overflow) {
         send_error_json(fd, 413, "Rendered prompt exceeds static buffer or max_context", "invalid_request_error", buffers.response_buf);
         return;
     }
+    var prompt_imgs_buf: [constants.vision_max_images_default]engine_mod.PromptImage = undefined;
+    for (0..decoded_count) |ii| {
+        prompt_imgs_buf[ii] = .{
+            .pos = decoded_pos[ii],
+            .height = decoded_imgs[ii].height,
+            .width = decoded_imgs[ii].width,
+            .tokens = @intCast(decoded_imgs[ii].tokens),
+            .rgb = decoded_imgs[ii].rgb.?,
+        };
+    }
+    const prompt_images: []const engine_mod.PromptImage = prompt_imgs_buf[0..decoded_count];
     const system_prefix_tokens: u32 = enc_res.system_prefix_tokens;
     const prompt_len: usize = enc_res.prompt_len;
     if (prompt_len == 0 or prompt_len >= config.context_tokens_max) {
@@ -748,6 +868,8 @@ fn handle_chat_completions(
         .top_p = req_top_p,
         .top_k = req_top_k,
         .seed = req_seed,
+        .loopcd_omega = req_loopcd_omega,
+        .loopcd_ref = req_loopcd_ref,
     };
 
     if (!stream) {
@@ -775,8 +897,9 @@ fn handle_chat_completions(
             }
         };
         var ctx: NonStreamCtx = .{ .parser = &parser, .stops = &stops };
-        const stats = engine.generate_with_hint(
+        const stats = engine.generate_with_images(
             buffers.prompt_tokens[0..prompt_len],
+            prompt_images,
             system_prefix_tokens,
             gen_limit,
             @intCast(req_mtp),
@@ -845,11 +968,19 @@ fn handle_chat_completions(
             return;
         }
 
-        tiger.print_stdout(
-            "[http] POST /v1/chat/completions prompt={d} (cached={d}) gen={d} temp={d:.2} prefill={d:.1}ms decode={d:.1}ms ({d:.1} tok/s, dl={d:.2})\n",
-            .{ stats.prompt_tokens, stats.cached_tokens, stats.generated_tokens, req_temp, stats.prefill_ms, stats.decode_ms, tps, dl },
-        );
+        if (stats.image_tokens > 0) {
+            tiger.print_stdout(
+                "[http] POST /v1/chat/completions prompt={d} (cached={d}, img={d}/{d}tok vis={d:.1}ms) gen={d} temp={d:.2} prefill={d:.1}ms decode={d:.1}ms ({d:.1} tok/s, dl={d:.2})\n",
+                .{ stats.prompt_tokens, stats.cached_tokens, stats.images_encoded, stats.image_tokens, stats.vision_ms, stats.generated_tokens, req_temp, stats.prefill_ms, stats.decode_ms, tps, dl },
+            );
+        } else {
+            tiger.print_stdout(
+                "[http] POST /v1/chat/completions prompt={d} (cached={d}) gen={d} temp={d:.2} prefill={d:.1}ms decode={d:.1}ms ({d:.1} tok/s, dl={d:.2})\n",
+                .{ stats.prompt_tokens, stats.cached_tokens, stats.generated_tokens, req_temp, stats.prefill_ms, stats.decode_ms, tps, dl },
+            );
+        }
         send_json_response(fd, 200, bw.slice());
+        engine.save_post_decode_checkpoint();
         return;
     }
 
@@ -925,8 +1056,9 @@ fn handle_chat_completions(
         .stops = &stops,
     };
 
-    const stats = engine.generate_with_hint(
+    const stats = engine.generate_with_images(
         buffers.prompt_tokens[0..prompt_len],
+        prompt_images,
         system_prefix_tokens,
         gen_limit,
         @intCast(req_mtp),
@@ -934,16 +1066,25 @@ fn handle_chat_completions(
         StreamCtx.on_token,
         @ptrCast(&sctx),
     );
-    if (!sctx.conn_ok) return;
+    if (!sctx.conn_ok) {
+        engine.save_post_decode_checkpoint();
+        return;
+    }
 
     if (stops.count > 0 and !sctx.hit_stop and sctx.emitted_len < parser.content_writer.length) {
         const rem = parser.content_writer.slice()[sctx.emitted_len..];
-        if (!send_chat_sse_delta(fd, buffers.sse_buf, req_id, created, req_model, .content, rem, null, null)) return;
+        if (!send_chat_sse_delta(fd, buffers.sse_buf, req_id, created, req_model, .content, rem, null, null)) {
+            engine.save_post_decode_checkpoint();
+            return;
+        }
     }
 
     // Emit streaming OpenAI tool_calls delta chunk(s) before final finish_reason="tool_calls"!
     if (parser.tool_call_count > 0) {
-        if (!send_chat_sse_tool_calls(fd, buffers.sse_buf, req_id, created, req_model, &parser)) return;
+        if (!send_chat_sse_tool_calls(fd, buffers.sse_buf, req_id, created, req_model, &parser)) {
+            engine.save_post_decode_checkpoint();
+            return;
+        }
     }
 
     const hit_eos: bool = (stats.last_token_id == constants.eos_token_id);
@@ -951,14 +1092,22 @@ fn handle_chat_completions(
     const usage_opt: ?engine_mod.GenerateStats = if (include_usage) stats else null;
     _ = send_chat_sse_delta(fd, buffers.sse_buf, req_id, created, req_model, .empty, "", finish_reason, usage_opt);
     _ = send_all(fd, "data: [DONE]\n\n");
+    engine.save_post_decode_checkpoint();
 
     const dec_toks: f64 = @floatFromInt(if (stats.generated_tokens > 0) stats.generated_tokens - 1 else 0);
     const tps: f64 = if (stats.decode_ms > 0.0) (dec_toks * 1000.0 / stats.decode_ms) else 0.0;
     const dl: f64 = if (stats.spec_steps > 0) (dec_toks / @as(f64, @floatFromInt(stats.spec_steps))) else 1.0;
-    tiger.print_stdout(
-        "[http] POST /v1/chat/completions (stream) prompt={d} (cached={d}) gen={d} temp={d:.2} prefill={d:.1}ms decode={d:.1}ms ({d:.1} tok/s, dl={d:.2})\n",
-        .{ stats.prompt_tokens, stats.cached_tokens, stats.generated_tokens, req_temp, stats.prefill_ms, stats.decode_ms, tps, dl },
-    );
+    if (stats.image_tokens > 0) {
+        tiger.print_stdout(
+            "[http] POST /v1/chat/completions (stream) prompt={d} (cached={d}, img={d}/{d}tok vis={d:.1}ms) gen={d} temp={d:.2} prefill={d:.1}ms decode={d:.1}ms ({d:.1} tok/s, dl={d:.2})\n",
+            .{ stats.prompt_tokens, stats.cached_tokens, stats.images_encoded, stats.image_tokens, stats.vision_ms, stats.generated_tokens, req_temp, stats.prefill_ms, stats.decode_ms, tps, dl },
+        );
+    } else {
+        tiger.print_stdout(
+            "[http] POST /v1/chat/completions (stream) prompt={d} (cached={d}) gen={d} temp={d:.2} prefill={d:.1}ms decode={d:.1}ms ({d:.1} tok/s, dl={d:.2})\n",
+            .{ stats.prompt_tokens, stats.cached_tokens, stats.generated_tokens, req_temp, stats.prefill_ms, stats.decode_ms, tps, dl },
+        );
+    }
 }
 
 fn handle_text_completions(
@@ -983,6 +1132,8 @@ fn handle_text_completions(
     var req_temp: f32 = config.default_temperature;
     var req_top_p: f32 = config.default_top_p;
     var req_top_k: i32 = config.default_top_k;
+    var req_loopcd_omega: f32 = config.default_loopcd_omega;
+    var req_loopcd_ref: i32 = config.default_loopcd_ref;
     var has_seed: bool = false;
     var req_seed: u64 = 0;
     var stream: bool = false;
@@ -994,7 +1145,7 @@ fn handle_text_completions(
     var key_buf: [128]u8 = undefined;
 
     var field_iter: u32 = 0;
-    while (pos < body.len and field_iter < 64) : (field_iter += 1) {
+    while (pos < body.len and field_iter < 256) : (field_iter += 1) {
         tokenizer_mod.skip_ws(body, &pos);
         if (pos < body.len and body[pos] == '}') break;
         const k = tokenizer_mod.parse_json_string(body, &pos, &key_buf) orelse break;
@@ -1030,6 +1181,10 @@ fn handle_text_completions(
             echo = parse_json_bool(body, &pos);
         } else if (std.mem.eql(u8, k, "mtp")) {
             if (parse_json_i64_opt(body, &pos)) |v| req_mtp = clamp_i64_to_i32(v, 0, @intCast(constants.mtp_draft_count_max));
+        } else if (std.mem.eql(u8, k, "loopcd_omega")) {
+            if (parse_json_f64_opt(body, &pos)) |v| req_loopcd_omega = @floatCast(v);
+        } else if (std.mem.eql(u8, k, "loopcd_ref")) {
+            if (parse_json_i64_opt(body, &pos)) |v| req_loopcd_ref = if (v == 2) 2 else 1;
         } else if (std.mem.eql(u8, k, "stop")) {
             parse_stop_field(body, &pos, &stops);
         } else {
@@ -1047,6 +1202,8 @@ fn handle_text_completions(
     if (!std.math.isFinite(req_temp) or req_temp < 0.0) req_temp = 0.0;
     if (!std.math.isFinite(req_top_p) or req_top_p <= 0.0 or req_top_p > 1.0) req_top_p = 1.0;
     if (req_top_k < 0) req_top_k = 0;
+    if (!std.math.isFinite(req_loopcd_omega) or req_loopcd_omega < -1.0 or req_loopcd_omega > 2.0) req_loopcd_omega = config.default_loopcd_omega;
+    if (req_loopcd_ref != 1 and req_loopcd_ref != 2) req_loopcd_ref = config.default_loopcd_ref;
     req_mtp = tiger.max_i32(0, tiger.min_i32(@intCast(constants.mtp_draft_count_max), req_mtp));
 
     const prompt_len = tokenizer.encode_into(prompt, true, &buffers.tok_scratch, buffers.prompt_tokens);
@@ -1072,6 +1229,8 @@ fn handle_text_completions(
         .top_p = req_top_p,
         .top_k = req_top_k,
         .seed = req_seed,
+        .loopcd_omega = req_loopcd_omega,
+        .loopcd_ref = req_loopcd_ref,
     };
 
     if (!stream) {
@@ -1134,6 +1293,7 @@ fn handle_text_completions(
             return;
         }
         send_json_response(fd, 200, bw.slice());
+        engine.save_post_decode_checkpoint();
         return;
     }
 
@@ -1180,6 +1340,7 @@ fn handle_text_completions(
     bw.append_slice("}]}\n\n");
     _ = send_all(fd, bw.slice());
     _ = send_all(fd, "data: [DONE]\n\n");
+    engine.save_post_decode_checkpoint();
 }
 
 const DeltaKind = enum { role, content, reasoning, empty };
@@ -1299,6 +1460,7 @@ const ChatEncodeResult = struct {
     prompt_len: usize = 0,
     system_prefix_tokens: u32 = 0,
     overflow: bool = false,
+    img_error: []const u8 = "",
 };
 
 fn json_array_has_items(arr: []const u8) bool {
@@ -1335,13 +1497,19 @@ fn encode_chat_template_zero_alloc(
     messages_json: []const u8,
     tools_json: []const u8,
     effort: []const u8,
-    keep_history_thinking: bool,
+    config: *const ServerConfig,
     enable_thinking: bool,
     buffers: *ServerBuffers,
+    decoded_imgs: []cuda.CDecodedImage,
+    decoded_pos: []u32,
+    decoded_count: *usize,
 ) ChatEncodeResult {
+    const keep_history_thinking: bool = config.keep_history_thinking;
     var out_len: usize = 0;
     var overflow: bool = false;
+    var img_error: []const u8 = "";
     const scratch = buffers.scratch_str_buf;
+    buffers.tool_id_map.clear();
 
     if (json_array_has_items(tools_json)) {
         append_encoded_segment(tokenizer, "<|message_system|>tool_declare<|content_xml|>", true, buffers, &out_len, &overflow);
@@ -1350,7 +1518,7 @@ fn encode_chat_template_zero_alloc(
         var tp: usize = 1;
         var t_iter: u32 = 0;
         var emitted_tools: u32 = 0;
-        while (tp < tools_json.len and t_iter < 256 and ok) : (t_iter += 1) {
+        while (tp < tools_json.len and t_iter < 1024 and ok) : (t_iter += 1) {
             tokenizer_mod.skip_ws(tools_json, &tp);
             if (tp >= tools_json.len or tools_json[tp] == ']') break;
             const t_start = tp;
@@ -1394,7 +1562,7 @@ fn encode_chat_template_zero_alloc(
     var effort_render: [128]u8 = undefined;
     var pos: usize = 1; // skip '['
     var msg_iter: u32 = 0;
-    while (pos < messages_json.len and msg_iter < 1024 and !overflow) : (msg_iter += 1) {
+    while (pos < messages_json.len and msg_iter < 65536 and !overflow) : (msg_iter += 1) {
         tokenizer_mod.skip_ws(messages_json, &pos);
         if (pos >= messages_json.len or messages_json[pos] == ']') break;
         if (messages_json[pos] != '{') {
@@ -1434,7 +1602,7 @@ fn encode_chat_template_zero_alloc(
         if (std.mem.eql(u8, role, "tool") and (resolved_name == null or resolved_name.?.len == 0)) {
             var tcid_buf: [128]u8 = undefined;
             if (extract_string_field(msg_obj, "tool_call_id", &tcid_buf)) |tcid| {
-                resolved_name = resolve_tool_name_by_id(messages_json[0..obj_start], tcid, &name_buf);
+                resolved_name = buffers.tool_id_map.lookup(tcid, &name_buf);
             }
         }
         const is_assistant: bool = std.mem.eql(u8, role, "assistant");
@@ -1475,7 +1643,7 @@ fn encode_chat_template_zero_alloc(
             } else if (c_raw.len > 0 and c_raw[0] == '[') {
                 var ap: usize = 1;
                 var part_iter: u32 = 0;
-                while (ap < c_raw.len and part_iter < 64 and !overflow) : (part_iter += 1) {
+                while (ap < c_raw.len and part_iter < 1024 and !overflow) : (part_iter += 1) {
                     tokenizer_mod.skip_ws(c_raw, &ap);
                     if (ap >= c_raw.len or c_raw[ap] == ']') break;
                     if (c_raw[ap] == '"') {
@@ -1491,7 +1659,89 @@ fn encode_chat_template_zero_alloc(
                         const ps_start = ap;
                         tokenizer_mod.skip_json_value(c_raw, &ap);
                         const part_obj = c_raw[ps_start..ap];
-                        if (extract_string_field(part_obj, "text", scratch)) |ts| {
+                        var ptype_buf: [64]u8 = undefined;
+                        const ptype = extract_string_field(part_obj, "type", &ptype_buf) orelse "";
+                        const is_img_part: bool = std.mem.eql(u8, ptype, "image_url") or
+                            std.mem.eql(u8, ptype, "input_image") or
+                            std.mem.eql(u8, ptype, "image");
+                        if (is_img_part) {
+                            if (!config.vision_enabled) {
+                                img_error = "Vision tower is not loaded on this server";
+                                return .{ .img_error = img_error };
+                            }
+                            if (!std.mem.eql(u8, role, "user") and !std.mem.eql(u8, role, "tool")) {
+                                img_error = "Image content is only supported for user and tool messages";
+                                return .{ .img_error = img_error };
+                            }
+                            const max_imgs: usize = @min(@as(usize, config.max_images), decoded_imgs.len);
+                            if (decoded_count.* >= max_imgs) {
+                                img_error = "Request exceeds maximum number of images";
+                                return .{ .img_error = img_error };
+                            }
+                            var uri_slice: ?[]const u8 = null;
+                            var b64_slice: ?[]const u8 = null;
+                            if (extract_raw_field(part_obj, "image_url")) |iu_raw| {
+                                if (iu_raw.len > 0 and iu_raw[0] == '{') {
+                                    uri_slice = extract_string_field(iu_raw, "url", scratch);
+                                } else if (iu_raw.len > 0 and iu_raw[0] == '"') {
+                                    var iup: usize = 0;
+                                    uri_slice = tokenizer_mod.parse_json_string(iu_raw, &iup, scratch);
+                                }
+                            }
+                            if (uri_slice == null) uri_slice = extract_string_field(part_obj, "image", scratch);
+                            if (uri_slice == null) uri_slice = extract_string_field(part_obj, "url", scratch);
+                            if (uri_slice == null) {
+                                if (extract_raw_field(part_obj, "source")) |src_obj| {
+                                    if (src_obj.len > 0 and src_obj[0] == '{') {
+                                        var sk_buf: [32]u8 = undefined;
+                                        const sk = extract_string_field(src_obj, "type", &sk_buf) orelse "";
+                                        if (std.mem.eql(u8, sk, "base64")) {
+                                            b64_slice = extract_string_field(src_obj, "data", scratch);
+                                        } else if (std.mem.eql(u8, sk, "url")) {
+                                            uri_slice = extract_string_field(src_obj, "url", scratch);
+                                        }
+                                    }
+                                }
+                            }
+                            if (uri_slice == null and b64_slice == null) {
+                                img_error = "Image part requires a base64 data: URI (image_url.url) or base64 source.data";
+                                return .{ .img_error = img_error };
+                            }
+                            const slot_idx: usize = decoded_count.*;
+                            const max_tok_i32: i32 = @intCast(config.image_max_tokens);
+                            const dec_rc: i32 = if (uri_slice) |u|
+                                cuda.squid_image_decode_data_uri(u.ptr, u.len, max_tok_i32, &decoded_imgs[slot_idx])
+                            else
+                                cuda.squid_image_decode_base64(b64_slice.?.ptr, b64_slice.?.len, max_tok_i32, &decoded_imgs[slot_idx]);
+                            if (dec_rc != 0 or decoded_imgs[slot_idx].rgb == null or decoded_imgs[slot_idx].tokens <= 0) {
+                                img_error = if (dec_rc == -7)
+                                    "Only base64 data: URIs (data:image/...;base64,...) are supported"
+                                else if (dec_rc == -5)
+                                    "WebP decoding not enabled in this build (use PNG/JPEG/GIF/BMP or build with -Dwebp=true)"
+                                else
+                                    "Failed to decode image payload";
+                                return .{ .img_error = img_error };
+                            }
+                            const n_img_toks: usize = @intCast(decoded_imgs[slot_idx].tokens);
+                            decoded_count.* = slot_idx + 1;
+
+                            emitted_assistant_block = true;
+                            append_encoded_segment(tokenizer, role_tok, true, buffers, &out_len, &overflow);
+                            if (resolved_name) |nm| append_encoded_segment(tokenizer, nm, false, buffers, &out_len, &overflow);
+                            append_encoded_segment(tokenizer, "<|content_image|>", true, buffers, &out_len, &overflow);
+                            if (out_len + n_img_toks >= buffers.prompt_tokens.len) {
+                                overflow = true;
+                            } else {
+                                decoded_pos[slot_idx] = @intCast(out_len);
+                                const img_hash: u64 = decoded_imgs[slot_idx].hash;
+                                var ki: usize = 0;
+                                while (ki < n_img_toks) : (ki += 1) {
+                                    buffers.prompt_tokens[out_len + ki] = cuda.squid_image_token_id(img_hash, @intCast(ki));
+                                }
+                                out_len += n_img_toks;
+                            }
+                            append_encoded_segment(tokenizer, "<|end_message|>", true, buffers, &out_len, &overflow);
+                        } else if (extract_string_field(part_obj, "text", scratch)) |ts| {
                             emitted_assistant_block = true;
                             append_encoded_segment(tokenizer, role_tok, true, buffers, &out_len, &overflow);
                             if (resolved_name) |nm| append_encoded_segment(tokenizer, nm, false, buffers, &out_len, &overflow);
@@ -1513,7 +1763,7 @@ fn encode_chat_template_zero_alloc(
             const tc_arr = tc_raw_opt.?;
             var tcp: usize = 1;
             var tc_iter: u32 = 0;
-            while (tcp < tc_arr.len and tc_iter < 32 and !overflow) : (tc_iter += 1) {
+            while (tcp < tc_arr.len and tc_iter < 256 and !overflow) : (tc_iter += 1) {
                 tokenizer_mod.skip_ws(tc_arr, &tcp);
                 if (tcp >= tc_arr.len or tc_arr[tcp] == ']') break;
                 const tc_start = tcp;
@@ -1521,37 +1771,47 @@ fn encode_chat_template_zero_alloc(
                 const tc_obj = tc_arr[tc_start..tcp];
                 if (extract_raw_field(tc_obj, "function")) |fn_obj| {
                     var fname_buf: [256]u8 = undefined;
-                    if (extract_string_field(fn_obj, "name", &fname_buf)) |fname| {
-                        emitted_assistant_block = true;
-                        append_encoded_segment(tokenizer, "<|message_model|>", true, buffers, &out_len, &overflow);
-                        append_encoded_segment(tokenizer, fname, false, buffers, &out_len, &overflow);
-                        append_encoded_segment(tokenizer, "<|content_invoke_tool_json|>", true, buffers, &out_len, &overflow);
-                        var tw = tiger.ByteWriter.init(buffers.render_buf);
-                        var tok_ok: bool = tw.try_append_slice("{\"name\":");
-                        tok_ok = tok_ok and tw.try_append_json_escaped(fname);
-                        tok_ok = tok_ok and tw.try_append_slice(",\"args\":");
-                        if (extract_raw_field(fn_obj, "arguments")) |args_raw| {
-                            if (args_raw.len > 0 and args_raw[0] == '"') {
-                                var ap2: usize = 0;
-                                if (tokenizer_mod.parse_json_string(args_raw, &ap2, scratch)) |args_str| {
-                                    const trimmed = trim_ascii_ws(args_str);
-                                    tok_ok = tok_ok and tw.try_append_slice(if (trimmed.len > 0) trimmed else "{}");
+                    if (extract_raw_field(fn_obj, "name")) |fname_raw| {
+                        var fnp: usize = 0;
+                        if (tokenizer_mod.parse_json_string(fname_raw, &fnp, &fname_buf)) |fname| {
+                            if (extract_raw_field(tc_obj, "id")) |id_raw| {
+                                var id_buf: [128]u8 = undefined;
+                                var idp: usize = 0;
+                                if (tokenizer_mod.parse_json_string(id_raw, &idp, &id_buf)) |id_val| {
+                                    buffers.tool_id_map.insert(id_val, id_raw, fname_raw);
+                                }
+                            }
+                            emitted_assistant_block = true;
+                            append_encoded_segment(tokenizer, "<|message_model|>", true, buffers, &out_len, &overflow);
+                            append_encoded_segment(tokenizer, fname, false, buffers, &out_len, &overflow);
+                            append_encoded_segment(tokenizer, "<|content_invoke_tool_json|>", true, buffers, &out_len, &overflow);
+                            var tw = tiger.ByteWriter.init(buffers.render_buf);
+                            var tok_ok: bool = tw.try_append_slice("{\"name\":");
+                            tok_ok = tok_ok and tw.try_append_json_escaped(fname);
+                            tok_ok = tok_ok and tw.try_append_slice(",\"args\":");
+                            if (extract_raw_field(fn_obj, "arguments")) |args_raw| {
+                                if (args_raw.len > 0 and args_raw[0] == '"') {
+                                    var ap2: usize = 0;
+                                    if (tokenizer_mod.parse_json_string(args_raw, &ap2, scratch)) |args_str| {
+                                        const trimmed = trim_ascii_ws(args_str);
+                                        tok_ok = tok_ok and tw.try_append_slice(if (trimmed.len > 0) trimmed else "{}");
+                                    } else {
+                                        tok_ok = tok_ok and tw.try_append_slice("{}");
+                                    }
                                 } else {
-                                    tok_ok = tok_ok and tw.try_append_slice("{}");
+                                    tok_ok = tok_ok and tw.try_append_slice(args_raw);
                                 }
                             } else {
-                                tok_ok = tok_ok and tw.try_append_slice(args_raw);
+                                tok_ok = tok_ok and tw.try_append_slice("{}");
                             }
-                        } else {
-                            tok_ok = tok_ok and tw.try_append_slice("{}");
+                            tok_ok = tok_ok and tw.try_append_byte('}');
+                            if (!tok_ok) {
+                                overflow = true;
+                            } else {
+                                append_encoded_segment(tokenizer, tw.slice(), false, buffers, &out_len, &overflow);
+                            }
+                            append_encoded_segment(tokenizer, "<|end_message|>", true, buffers, &out_len, &overflow);
                         }
-                        tok_ok = tok_ok and tw.try_append_byte('}');
-                        if (!tok_ok) {
-                            overflow = true;
-                        } else {
-                            append_encoded_segment(tokenizer, tw.slice(), false, buffers, &out_len, &overflow);
-                        }
-                        append_encoded_segment(tokenizer, "<|end_message|>", true, buffers, &out_len, &overflow);
                     }
                 }
                 tokenizer_mod.skip_ws(tc_arr, &tcp);
@@ -1570,6 +1830,12 @@ fn encode_chat_template_zero_alloc(
         if (pos < messages_json.len and messages_json[pos] == ',') pos += 1;
     }
 
+    // Never silently truncate trailing messages if the loop cap was hit!
+    if (!overflow) {
+        tokenizer_mod.skip_ws(messages_json, &pos);
+        if (pos < messages_json.len and messages_json[pos] != ']') overflow = true;
+    }
+
     if (!effort_emitted and !overflow) {
         var ew = tiger.ByteWriter.init(&effort_render);
         _ = tokenizer_mod.Tokenizer.try_emit_thinking_effort(&ew, effort);
@@ -1584,48 +1850,6 @@ fn encode_chat_template_zero_alloc(
         .system_prefix_tokens = system_prefix_tokens,
         .overflow = overflow,
     };
-}
-
-fn resolve_tool_name_by_id(prior_messages_prefix: []const u8, target_id: []const u8, out_buf: []u8) ?[]const u8 {
-    if (prior_messages_prefix.len < 2 or target_id.len == 0) return null;
-    var pos: usize = 1;
-    var msg_iter: u32 = 0;
-    while (pos < prior_messages_prefix.len and msg_iter < 1024) : (msg_iter += 1) {
-        tokenizer_mod.skip_ws(prior_messages_prefix, &pos);
-        if (pos >= prior_messages_prefix.len or prior_messages_prefix[pos] != '{') {
-            if (pos < prior_messages_prefix.len) pos += 1;
-            continue;
-        }
-        const obj_start = pos;
-        tokenizer_mod.skip_json_value(prior_messages_prefix, &pos);
-        const msg_obj = prior_messages_prefix[obj_start..pos];
-        if (extract_raw_field(msg_obj, "tool_calls")) |tc_arr| {
-            if (tc_arr.len > 2 and tc_arr[0] == '[') {
-                var tcp: usize = 1;
-                var tc_iter: u32 = 0;
-                while (tcp < tc_arr.len and tc_iter < 32) : (tc_iter += 1) {
-                    tokenizer_mod.skip_ws(tc_arr, &tcp);
-                    if (tcp >= tc_arr.len or tc_arr[tcp] == ']') break;
-                    const tc_start = tcp;
-                    tokenizer_mod.skip_json_value(tc_arr, &tcp);
-                    const tc_obj = tc_arr[tc_start..tcp];
-                    var id_buf: [128]u8 = undefined;
-                    if (extract_string_field(tc_obj, "id", &id_buf)) |id_val| {
-                        if (std.mem.eql(u8, id_val, target_id)) {
-                            if (extract_raw_field(tc_obj, "function")) |fn_obj| {
-                                return extract_string_field(fn_obj, "name", out_buf);
-                            }
-                        }
-                    }
-                    tokenizer_mod.skip_ws(tc_arr, &tcp);
-                    if (tcp < tc_arr.len and tc_arr[tcp] == ',') tcp += 1;
-                }
-            }
-        }
-        tokenizer_mod.skip_ws(prior_messages_prefix, &pos);
-        if (pos < prior_messages_prefix.len and prior_messages_prefix[pos] == ',') pos += 1;
-    }
-    return null;
 }
 
 // --- Low-Level Socket, UTF-8 & Iterative JSON Field Helpers ---
@@ -1846,7 +2070,7 @@ fn extract_raw_field(obj: []const u8, target_key: []const u8) ?[]const u8 {
     pos += 1;
     var kbuf: [128]u8 = undefined;
     var iter: u32 = 0;
-    while (pos < obj.len and iter < 64) : (iter += 1) {
+    while (pos < obj.len and iter < 256) : (iter += 1) {
         tokenizer_mod.skip_ws(obj, &pos);
         if (pos >= obj.len or obj[pos] == '}') break;
         const k = tokenizer_mod.parse_json_string(obj, &pos, &kbuf) orelse break;

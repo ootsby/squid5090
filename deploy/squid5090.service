@@ -10,11 +10,11 @@ Environment="LD_LIBRARY_PATH=/usr/local/cuda/lib64"
 # Optional: require Authorization: Bearer <key>
 # Environment="SQUID_API_KEY=your-secret-key"
 
-# Default: high-accuracy FP8 dense/lm_head + official L0-23 MoE experts (0.0095 KLD, dPPL +0.0035)
-# with 512K (524,288) Q4 KV (~22.6 GiB VRAM), adaptive {2, 4, 8} DSpark + Hybrid Prompt-Lookup,
-# and exact Leviathan/Chen temp=1.0 / top-p=0.95 rejection sampling.
-# For 256K FP8 KV (0.0061 KLD, ~22.6 GiB): --kv fp8 --ctx 262144
-# For max-speed 1M NVFP4 (~23.2 GiB):      --mode nvfp4 --kv q4 --ctx 1048576
+# Default: high-accuracy FP8 dense/lm_head + official L0-23 MoE experts (0.0093 KLD, dPPL +0.0056),
+# native 23-layer BF16 Vision Tower (PNG/JPEG/GIF/BMP/WebP), 512K (524,288) Q4 KV (~22.9 GiB VRAM with --embed-host),
+# adaptive {2, 4, 8} DSpark (embedded 32K shortlist + 16K dynamic ctx), and exact Leviathan/Chen temp=1.0 / top-p=0.95 rejection sampling.
+# For 256K FP8 KV (0.0059 KLD, ~23.2 GiB): --kv fp8 --ctx 262144
+# For max-speed 1M NVFP4 (~23.5 GiB):      --mode nvfp4 --kv q4 --ctx 1048576 --embed-host
 # Optional runtime-gated Fisher-LDA abliteration sidecar (generate first with tools/ablate.py):
 #     --ablation /opt/models/inkling-2-mini/inkling-2-mini-abliterated.safetensors
 ExecStart=/opt/squid5090/zig-out/bin/squid5090 serve /opt/models/inkling-2-mini \
@@ -23,6 +23,7 @@ ExecStart=/opt/squid5090/zig-out/bin/squid5090 serve /opt/models/inkling-2-mini 
     --mode fp8 \
     --kv q4 \
     --ctx 524288 \
+    --embed-host \
     --mtp 7 \
     --spec-threshold 0.80 \
     --temp 1.0 \

@@ -4,7 +4,7 @@ llama.cpp router API (so pi's /login llama.cpp and /llama work). Stdlib only; lo
     python router.py [--port 8000] [--config router.json]
 
 A model is a preset from router.json, optionally with options: "inkling-2-mini:abl,ctx=65536".
-Options (squid presets): ctx=N  mode=mix|f8|f18|nvfp4  kv=q4|fp8|bf16  mtp=0..7  batch=512|1024 (prefill)  abl | abl=0
+Options (squid presets): ctx=N  mode=mix|f8|f18|nvfp4  kv=q4|fp8|bf16  mtp=0..7  batch=512|1024 (prefill)  abl | abl=0  vision | vision=0 (image input, +0.6 GiB)
 
 GET  /models /v1/models /health /props
 POST /models/load {"model"}   /models/unload {"model", "force": true to cut off a running reply}
@@ -19,7 +19,7 @@ sys.path.insert(0, str(HERE / 'tools'))
 import vram_budget
 
 CONTAINER, CTX_MAX, BODY_MAX = 'squid-router', 131072, 32 << 20
-DEFAULTS = {'ctx': 32768, 'mode': 'mix', 'kv': 'q4', 'mtp': 7, 'batch': 512, 'abl': False}
+DEFAULTS = {'ctx': 32768, 'mode': 'mix', 'kv': 'q4', 'mtp': 7, 'batch': 512, 'abl': False, 'vision': False}
 MIXF = {'f8': '8', 'f18': '18'}  # SQUID_IQ3 value: layers with 3-bit gate/up experts, plus an FP8 lm_head
 
 
@@ -47,7 +47,7 @@ class Router:
         for o in filter(None, opts.split(',')):
             k, eq, v = o.partition('=')
             if k not in DEFAULTS: raise Bad(400, f'unknown option {k!r}; use {", ".join(DEFAULTS)}')
-            if k == 'abl': spec[k] = v not in ('0', 'off', 'false') if eq else True
+            if k in ('abl', 'vision'): spec[k] = v not in ('0', 'off', 'false') if eq else True
             elif k in ('ctx', 'mtp', 'batch'):
                 if not v.isdecimal(): raise Bad(400, f'{k} must be a number')
                 spec[k] = int(v)
@@ -62,9 +62,9 @@ class Router:
         return spec
 
     def arena_gib(self, s):  # measured weights with --embed-host and the drafter
-        mix = 12.65 if (Path(self.cfg['model_dir']) / 'iq3.safetensors').exists() else 14.02
-        w = {'mix': mix, 'f8': 13.29, 'f18': 12.16, 'nvfp4': 13.70}[s['mode']]
-        return w + vram_budget.runtime(s['ctx'], s['kv'], 1, s['batch']) / 2 ** 30
+        mix = 12.76 if (Path(self.cfg['model_dir']) / 'iq3.safetensors').exists() else 14.13  # B: D's measured drafter growth added
+        w = {'mix': mix, 'f8': 13.45, 'f18': 12.31, 'nvfp4': 13.81}[s['mode']]
+        return w + 0.60 * s['vision'] + vram_budget.runtime(s['ctx'], s['kv'], 1, s['batch']) / 2 ** 30
 
     # ---- backend processes
     def command(self, s):
@@ -73,7 +73,7 @@ class Router:
              '-p', f'127.0.0.1:{self.port(s)}:8000', '-v', f'{self.cfg.get("volume") or self.cfg["model_dir"]}:/model:ro',
              *(['-e', 'SQUID_IQ3=' + MIXF[s['mode']]] if s['mode'] in MIXF else []), self.cfg['image'].format(batch=s['batch']),
              'serve', '/model', '--host', '0.0.0.0', '--port', '8000', '--mode', 'mix' if s['mode'] in MIXF else s['mode'], '--kv', s['kv'],
-             '--ctx', str(s['ctx']), '--mtp', str(s['mtp']), '--embed-host']
+             '--ctx', str(s['ctx']), '--mtp', str(s['mtp']), '--embed-host', *([] if s['vision'] else ['--no-vision'])]
         return c + (['--ablation', '/model/' + self.cfg['ablation_file']] if s['abl'] else [])
 
     def port(self, s): return s.get('port', self.cfg.get('backend_port', 8001))

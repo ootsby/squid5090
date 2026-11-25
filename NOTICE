@@ -9,13 +9,27 @@ following open-source projects:
    - Runtime-gated Fisher-LDA directional ablation tensor schema & projection formula
      (optional `--ablation <path.safetensors>` support in src/weights.zig,
      cuda/kernels_inkling.cu, and cuda/kernels_prefill.cu).
-   - Blackwell Programmatic Dependent Launch (PDL) overlap pattern and register-
-     permuted Tensor Core `mma.m16n8k16` decode MoE and dense NVFP4 GEMV structure
+   - Blackwell Programmatic Dependent Launch (PDL) overlap pattern, 16-CTA cluster
+     DSMEM/`mbarrier` BF16 controller & router kernels and 1-launch cluster decode
+     attention (`mapa.shared::cluster`, `st.async.weak.shared::cluster`), spill-free
+     16-column `U=3` FP8/NVFP4 `mma.m16n8k16` GEMVs & LM-head, and 128-CTA
+     multi-block stochastic LM-head sampling with 64-bit Gumbel precision
      (cuda/kernels_common.cuh, cuda/kernels_gemv.cu, cuda/kernels_inkling.cu).
    - Device-side adaptive `{2, 4, 8}` DSpark speculative verify width selection via
-     CUDA Graph conditional switch (`cudaGraphCondTypeSwitch`) and Markov-head
-     online softmax confidence scoring (cuda/kernels_dspark.cu, cuda/cuda_abi.cu,
-     src/engine.zig).
+     CUDA Graph conditional switch (`cudaGraphCondTypeSwitch`), Top-K `1024`
+     multi-CTA radix Markov candidate selection, embedded corpus-frequency-ranked
+     draft shortlist (`src/draft_shortlist.bin`), dynamic context shortlist
+     extension, and Markov-head online softmax confidence scoring
+     (cuda/kernels_dspark.cu, cuda/cuda_abi.cu, src/weights.zig, src/engine.zig).
+   - Single-barrier multi-value warp/block reductions (`warp_reduce_scatter`,
+     `block_sum_bcast`), single-pass FP16-activation 16-CTA cluster router, and
+     coalesced 128B-sector `uint4` MXFP8 BF16 Tensor Core MoE decode fragments
+     (cuda/kernels_common.cuh, cuda/kernels_inkling.cu, cuda/kernels_gemv.cu).
+   - Native 23-layer BF16 Vision Tower (`model.visual.*`) kernel math, 8x8
+     checkerboard alpha compositing, aspect-preserving area-average downscale,
+     and content-addressed negative synthetic image token IDs for automatic
+     prefix-cache reuse (cuda/kernels_vision.cu, cuda/image_decode.cpp,
+     src/weights.zig, src/engine.zig, src/server.zig).
    - Multi-stage `cp.async` `128x128x64` grouped MoE GEMM pipeline structure for
      prefill, specialized for Blackwell `cvt.rn.f16x2.e2m1x2` + FP16 MMA
      (cuda/kernels_prefill.cu).
@@ -24,16 +38,25 @@ following open-source projects:
      tools/pyproject.toml), adapted to run via `uv` and evaluate refusals via
      `squid5090 serve`.
 
-2. AtomicBot-ai/atomic-engine (MIT License, llama.cpp fork)
+2. nothings/stb — stb_image.h (MIT License / Public Domain)
+   https://github.com/nothings/stb
+   - Vendored single-header image decoder (`third_party/stb_image.h`) used in
+     `cuda/image_decode.cpp` for PNG, JPEG, GIF, and BMP decoding.
+
+3. libwebp (BSD 3-Clause License, optional dynamic link via `zig build -Dwebp=true`)
+   https://chromium.googlesource.com/webm/libwebp
+   - Optional WebP and animated WebP decoding in `cuda/image_decode.cpp`.
+
+4. AtomicBot-ai/atomic-engine (MIT License, llama.cpp fork)
    https://github.com/AtomicBot-ai/atomic-engine/tree/codex/expert-weight-source
-   - Inspiration for hybrid prompt-lookup speculative drafting with DSpark
+   - Inspiration for opt-in hybrid prompt-lookup speculative drafting with DSpark
      fallback (implemented from scratch as a zero-malloc O(1) hash-indexed
      PromptLookupIndex in src/engine.zig).
 
-3. sybil-solutions/inference-optimisation-skill
+5. sybil-solutions/inference-optimisation-skill
    https://github.com/sybil-solutions/inference-optimisation-skill
    - Hardware-ceiling roofline methodology, noise-controlled hill-climbing
      workflow, and lever prioritization documented in LEARNINGS.md.
 
-4. Inkling-2-Mini model architecture & tokenizer specification (Apache License 2.0)
+6. Inkling-2-Mini model architecture & tokenizer specification (Apache License 2.0)
    Thinking Machines / Inkling-2-Mini.

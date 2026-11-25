@@ -46,12 +46,25 @@ pub const mtp_draft_count_max: u32 = 7;
 pub const mtp_markov_rank: u32 = 256;
 pub const mtp_target_visits: [4]u32 = .{ 5, 23, 41, 48 };
 
+// Inkling-2-Mini Vision Tower constants (model.visual.*)
+pub const vision_layer_count: u32 = 23;
+pub const vision_hidden_dim: u32 = 1024;
+pub const vision_patch_dim: u32 = 1200;
+pub const vision_mlp_dim: u32 = 4096;
+pub const vision_merged_dim: u32 = 4096;
+pub const vision_pos_grid: u32 = 32;
+pub const vision_rope_freqs: u32 = 16;
+pub const vision_tile_px: u32 = 40;
+pub const vision_max_tokens_default: u32 = 4096;
+pub const vision_max_images_default: u32 = 16;
+
 // FlashDecoding Split-K and Q4 KV constants
 pub const kv_q4_group_size: u32 = 64;
 pub const kv_q4_groups_per_head: u32 = head_dim / kv_q4_group_size; // 2
 pub const kv_q4_scales_per_token: u32 = kv_head_count * kv_q4_groups_per_head; // 16
 pub const split_buffer_floats: u64 = 2_050_000;
-pub const dspark_workspace_floats: u64 = 2_000_000;
+pub const dspark_workspace_floats: u64 = 3_200_000;
+pub const dspark_dynamic_ctx_rows: u32 = 16384;
 
 pub const vram_alignment_bytes: u64 = 256;
 pub const qrgs_out_dim: u32 = query_dim + r_dim + query_dim + head_count; // 6552

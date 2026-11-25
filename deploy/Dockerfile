@@ -14,6 +14,7 @@ WORKDIR /src
 COPY build.zig ./
 COPY cuda cuda
 COPY src src
+COPY third_party third_party
 # ponytail: prefill batch is a source constant upstream; sed it here, make it a -D option if it needs more values
 ARG PREFILL_BATCH=2048
 RUN sed -i "s/^const prefill_batch_max: u32 = 2048;/const prefill_batch_max: u32 = ${PREFILL_BATCH};/" src/engine.zig && grep -q "^const prefill_batch_max: u32 = ${PREFILL_BATCH};" src/engine.zig

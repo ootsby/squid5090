@@ -118,15 +118,47 @@ struct DsparkWeights {
     __nv_bfloat16* hidden_out_b = nullptr; // [2304]
 
     // Precomputed folded draft projections for blazing fast Markov RNN argmax:
-    // Optional pruned draft vocabulary (e.g. 32K/49K tokens -> 4-6x faster drafter, 100% lossless!)
+    // Optional pruned draft vocabulary (32K base + 4096 dynamic context rows -> 100% lossless!)
     int draft_vocab_size = VOCAB_UNPADDED;
-    int32_t* draft_vocab_ids = nullptr;     // [draft_vocab_size] maps local idx -> real vocab ID (nullptr = identity)
-    int32_t* inv_draft_vocab_ids = nullptr; // [VOCAB_UNPADDED] maps real vocab ID -> local idx or -1 (nullptr = identity)
-    LinearWeight unembed_draft;             // [draft_vocab_size, 2304] (NVFP4: only 42-64 MB!)
-    LinearWeight fold_w;                // [draft_vocab_size, 256]  (NVFP4: only 4.7-7.0 MB!)
-    float* fold_b = nullptr;            // [draft_vocab_size] F32
+    int draft_vocab_cap = VOCAB_UNPADDED;
+    int32_t* d_draft_vocab_size = nullptr;  // device-side active count (nullptr = static draft_vocab_size)
+    int32_t* draft_vocab_ids = nullptr;     // [draft_vocab_cap] maps local idx -> real vocab ID (nullptr = identity)
+    int32_t* inv_draft_vocab_ids = nullptr; // unused with full-vocab sparse draft probs (kept for ABI compat)
+    LinearWeight unembed_draft;             // [draft_vocab_cap, 2304]
+    LinearWeight fold_w;                    // [VOCAB_UNPADDED, 256] BF16 (indexed by real token ID!)
+    float* fold_b = nullptr;                // [VOCAB_UNPADDED] F32 (indexed by real token ID!)
 
     DsparkLayerWeights layers[MTP_LAYERS];
+};
+
+struct VisionLayerWeights {
+    const float* ln1_w = nullptr;         // [1024]
+    const float* ln1_b = nullptr;         // [1024]
+    const float* ln2_w = nullptr;         // [1024]
+    const float* ln2_b = nullptr;         // [1024]
+    const float* ls1 = nullptr;           // [1024]
+    const float* ls2 = nullptr;           // [1024]
+    const __nv_bfloat16* wqkv = nullptr;  // [3072, 1024] stacked Q, K, V
+    const float* bqkv = nullptr;          // [3072]
+    const __nv_bfloat16* wo = nullptr;    // [1024, 1024]
+    const float* bo = nullptr;            // [1024]
+    const __nv_bfloat16* fc = nullptr;    // [4096, 1024]
+    const float* bfc = nullptr;           // [4096]
+    const __nv_bfloat16* proj = nullptr;  // [1024, 4096]
+    const float* bproj = nullptr;         // [1024]
+};
+
+struct VisionWeights {
+    bool loaded = false;
+    const __nv_bfloat16* patch_w = nullptr;  // [1024, 1200]
+    const float* pos = nullptr;              // [32*32, 1024]
+    const float* cls = nullptr;              // [1024] class_embedding + cls_position_embedding
+    const float* ln_pre_w = nullptr;         // [1024]
+    const float* ln_pre_b = nullptr;         // [1024]
+    const __nv_bfloat16* proj_in = nullptr;  // [4096, 4096]
+    const __nv_bfloat16* proj_out = nullptr; // [2304, 4096]
+    const float* inv_freq = nullptr;         // [16]
+    VisionLayerWeights layers[VISION_LAYERS];
 };
 
 struct ModelWeights {
