@@ -68,7 +68,7 @@ class Router:
     def command(self, s):
         if 'cmd' in s: return s['cmd']
         c = ['wslc', 'run', '--rm', '--name', CONTAINER, '--gpus', 'all', '--ulimit', 'memlock=-1',
-             '-p', f'127.0.0.1:{self.port(s)}:8000', '-v', f'{self.cfg["model_dir"]}:/model:ro', self.cfg['image'],
+             '-p', f'127.0.0.1:{self.port(s)}:8000', '-v', f'{self.cfg.get("volume") or self.cfg["model_dir"]}:/model:ro', self.cfg['image'],
              'serve', '/model', '--host', '0.0.0.0', '--port', '8000', '--mode', s['mode'], '--kv', s['kv'],
              '--ctx', str(s['ctx']), '--mtp', str(s['mtp']), '--embed-host']
         return c + (['--ablation', '/model/' + self.cfg['ablation_file']] if s['abl'] else [])
