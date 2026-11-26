@@ -1,3 +1,11 @@
+> **About this fork (ootsby/squid5090).** This is a fork of [`tensorfish/squid5090`](https://github.com/tensorfish/squid5090), which targets the RTX 5090. The fork adapts it for smaller Blackwell cards, starting with the RTX 5070 Ti (16 GB), with 3-bit expert mixes that fit in 16 GB, a container setup and a model router. See [`5070TI.md`](5070TI.md) for setup and measured results.
+>
+> - **`main`** is the fork's working branch: upstream merged in selectively, with fallbacks for kernels the 5070 Ti can't run.
+> - **`upstream_main`** mirrors upstream's `main` unchanged.
+> - Other branches are work in progress that lands in `main`.
+>
+> Below this note, the README is upstream's.
+
 # squid5090
 
 **A single-binary, zero-Python TigerStyle Zig + Blackwell CUDA (`sm_120a`) text & vision inference engine and OpenAI-compatible HTTP/SSE server for [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) on an NVIDIA RTX 5090.**
