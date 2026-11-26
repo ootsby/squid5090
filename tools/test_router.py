@@ -37,6 +37,8 @@ try:
         try: f()
         except router.Bad as x: assert x.code == code, x; return str(x)
         raise AssertionError('accepted')
+    m = router.STATS.search('POST /v1/chat/completions (stream) prompt=3962 (cached=0, img=1/600tok vis=12.1ms) gen=29 temp=0.85 prefill=17999.5ms decode=4.3ms (73.5 tok/s, dl=2.15)')
+    assert m.groups() == ('3962', '0', '1', '29', '17999.5', '4.3', '73.5', '2.15'), m.groups()
     s = R.resolve('sq:abl,ctx=16384,mtp=0'); assert (s['abl'], s['ctx'], s['mtp'], s['mode']) == (True, 16384, 0, 'nvfp4')
     assert '--ablation' in R.command(s) and '--ablation' not in R.command(R.resolve('sq'))
     c = R.command(R.resolve('sq:mode=f8,batch=1024')); assert 'SQUID_IQ3=8' in c and 'x1024' in c and c[c.index('--mode') + 1] == 'mix'

@@ -10,7 +10,7 @@ GET  /models /v1/models /health /props
 POST /models/load {"model"}   /models/unload {"model", "force": true to cut off a running reply}
 POST /v1/chat/completions /v1/completions   (loads or swaps to "model" first)
 """
-import argparse, ctypes, http.client, json, os, subprocess, sys, threading, time, urllib.request
+import argparse, ctypes, http.client, json, os, re, subprocess, sys, threading, time, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -219,6 +219,25 @@ def wslc(*a): return subprocess.run(['wslc', *a], capture_output=True, text=True
 def log(m): print(time.strftime('%H:%M:%S'), m, flush=True)
 
 
+# squid prints one of these per reply (src/server.zig); the router has no other view of the token counts and timings
+STATS = re.compile(r'prompt=(\d+) \(cached=(\d+)(?:, img=(\d+)/\d+tok[^)]*)?\) gen=(\d+) \S+ prefill=([\d.]+)ms '
+                   r'decode=([\d.]+)ms \(([\d.]+) tok/s, dl=([\d.]+)\)')
+
+
+def report(name, off, wall):  # own thread: squid may log the line just after the reply ends
+    for _ in range(20):
+        try:
+            with open(HERE / 'router-backend.log', 'rb') as f: f.seek(off); m = STATS.search(f.read().decode(errors='replace'))
+        except OSError: return
+        if m: break
+        time.sleep(0.1)
+    else: return
+    p, c, img, g, pf, dc, tps, dl = m.groups()
+    new, pf = int(p) - int(c), float(pf) / 1000
+    log(f'{name}: prompt {p} tokens ({c} cached{f", {img} image" if img else ""}), prefill {pf:.1f} s'
+        f'{f" ({new / pf:.0f} tok/s)" if new and pf else ""}; generated {g} tokens at {tps} tok/s ({dl} per step); {wall:.1f} s total')
+
+
 def make_handler(R):
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a): pass
@@ -282,6 +301,9 @@ def make_handler(R):
                 d['enable_thinking'] = bool(kw['enable_thinking'])
                 if d['enable_thinking']: d.setdefault('reasoning_effort', 'medium')
             port = R.acquire(d.get('model'))
+            name, t0 = R.name, time.time()
+            try: off = (HERE / 'router-backend.log').stat().st_size
+            except OSError: off = 0
             c, started = http.client.HTTPConnection('127.0.0.1', port, timeout=600), False
             try:
                 c.request('POST', path, json.dumps(d).encode(), {'Content-Type': 'application/json'})
@@ -296,6 +318,7 @@ def make_handler(R):
                 if not started: raise Bad(502, f'backend error: {e}')
             finally:
                 c.close(); R.release()
+                if started: threading.Thread(target=report, args=(name, off, time.time() - t0), daemon=True).start()
     return H
 
 
