@@ -15,6 +15,6 @@ if not exist "%MODEL%\model-00001-of-00001.safetensors" (
 )
 wslc rm -f squid >nul 2>nul
 echo Starting squid5090 on http://localhost:%PORT%/v1  (loading takes about a minute)
-wslc run --rm -it --name squid --gpus all --ulimit memlock=-1 -p 127.0.0.1:%PORT%:8000 -v "%MODEL%:/model:ro" squid5090:mixd512 ^
+wslc run --rm -it --name squid --gpus all --ulimit memlock=-1 -p 127.0.0.1:%PORT%:8000 -v "%MODEL%:/model:ro" squid5090:f512 ^
   serve /model --host 0.0.0.0 --port 8000 --mode %MODE% --kv q4 --ctx 32768 --mtp 7 --embed-host %ABL%
 if errorlevel 1 pause

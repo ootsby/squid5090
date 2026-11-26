@@ -1,4 +1,4 @@
-> **About this fork (ootsby/squid5090).** This is a fork of [`tensorfish/squid5090`](https://github.com/tensorfish/squid5090), which targets the RTX 5090. The fork adapts it for smaller Blackwell cards, starting with the RTX 5070 Ti (16 GB), with 3-bit expert mixes that fit in 16 GB, a container setup and a model router. See [`5070TI.md`](5070TI.md) for setup and measured results.
+> **About this fork (ootsby/squid5090).** This is a fork of [`tensorfish/squid5090`](https://github.com/tensorfish/squid5090), which targets the RTX 5090. The fork adapts it for smaller Blackwell cards, starting with the RTX 5070 Ti (16 GB), with 3-bit expert mixes that fit in 16 GB, a container setup and a model router. Setup: [`SETUP-5070TI.md`](SETUP-5070TI.md). Measurements: [`5070TI.md`](5070TI.md).
 >
 > - **`main`** is the fork's working branch: upstream merged in selectively, with fallbacks for kernels the 5070 Ti can't run.
 > - **`upstream_main`** mirrors upstream's `main` unchanged.
